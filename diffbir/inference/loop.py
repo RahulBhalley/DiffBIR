@@ -1,3 +1,18 @@
+"""Base inference loop module for DiffBIR image restoration.
+
+This module provides the base InferenceLoop class that handles the core inference
+pipeline for various image restoration tasks. It manages model loading, image
+processing, and result saving.
+
+The inference loop supports:
+- Loading and managing multiple models (cleaner, CLDM, diffusion)
+- Batch processing of images with configurable settings
+- Multiple captioning options (LLaVA, RAM, empty)
+- Flexible prompt handling for controlled generation
+- Tiled processing for large images
+- Result saving with prompt tracking
+"""
+
 import os
 from typing import overload, Generator, List
 from argparse import Namespace
@@ -28,8 +43,28 @@ from ..utils.caption import (
 
 
 class InferenceLoop:
+    """Base class for running inference with DiffBIR models.
+    
+    This class provides the core functionality for loading models, processing images,
+    and saving results. It is designed to be subclassed for specific restoration tasks.
+    
+    Attributes:
+        args (Namespace): Command line arguments controlling inference behavior
+        loop_ctx (dict): Context dictionary for storing loop state
+        pipeline (Pipeline): The main inference pipeline
+        cldm (ControlLDM): Conditional latent diffusion model
+        diffusion (Diffusion): Diffusion model for noise scheduling
+        cleaner: Task-specific image cleaning model
+        captioner: Image captioning model for prompt generation
+        cond_fn: Optional conditioning function for guidance
+    """
 
     def __init__(self, args: Namespace) -> "InferenceLoop":
+        """Initialize the inference loop with given arguments.
+        
+        Args:
+            args: Namespace containing all inference parameters
+        """
         self.args = args
         self.loop_ctx = {}
         self.pipeline: Pipeline = None
@@ -46,6 +81,11 @@ class InferenceLoop:
     def load_cleaner(self) -> None: ...
 
     def load_cldm(self) -> None:
+        """Load and initialize the conditional latent diffusion model.
+        
+        Loads the CLDM model with appropriate weights based on version and task.
+        Also initializes the diffusion model for noise scheduling.
+        """
         self.cldm: ControlLDM = instantiate_from_config(
             OmegaConf.load("configs/inference/cldm.yaml")
         )
@@ -96,6 +136,10 @@ class InferenceLoop:
         self.diffusion.to(self.args.device)
 
     def load_cond_fn(self) -> None:
+        """Initialize the conditioning function for guidance if enabled.
+        
+        Sets up MSE or weighted MSE guidance based on arguments.
+        """
         if not self.args.guidance:
             self.cond_fn = None
             return
@@ -117,6 +161,13 @@ class InferenceLoop:
     def load_pipeline(self) -> None: ...
 
     def load_captioner(self) -> None:
+        """Initialize the image captioning model.
+        
+        Supports multiple captioner options:
+        - none: Empty captioner that returns no text
+        - llava: LLaVA vision-language model
+        - ram: RAM captioning model
+        """
         if self.args.captioner == "none":
             self.captioner = EmptyCaptioner(self.args.device)
         elif self.args.captioner == "llava":
@@ -129,10 +180,19 @@ class InferenceLoop:
             raise ValueError(f"unsupported captioner: {self.args.captioner}")
 
     def setup(self) -> None:
+        """Prepare output directory for saving results."""
         self.save_dir = self.args.output
         os.makedirs(self.save_dir, exist_ok=True)
 
     def load_lq(self) -> Generator[Image.Image, None, None]:
+        """Load low quality images from input directory.
+        
+        Yields:
+            PIL.Image: RGB input image to be processed
+            
+        Raises:
+            AssertionError: If input path is not a directory
+        """
         img_exts = [".png", ".jpg", ".jpeg"]
         assert os.path.isdir(
             self.args.input
@@ -149,10 +209,26 @@ class InferenceLoop:
             yield lq
 
     def after_load_lq(self, lq: Image.Image) -> np.ndarray:
+        """Process loaded image before inference.
+        
+        Args:
+            lq: Input PIL image
+            
+        Returns:
+            np.ndarray: Processed image as numpy array
+        """
         return np.array(lq)
 
     @torch.no_grad()
     def run(self) -> None:
+        """Run the full inference pipeline on all input images.
+        
+        Handles:
+        1. Loading and preprocessing images
+        2. Generating prompts via captioning
+        3. Batch processing through pipeline
+        4. Saving results and tracking prompts
+        """
         self.setup()
         auto_cast_type = {
             "fp32": torch.float32,
@@ -210,6 +286,17 @@ class InferenceLoop:
             self.save(samples, pos_prompt, neg_prompt)
 
     def save(self, samples: List[np.ndarray], pos_prompt: str, neg_prompt: str) -> None:
+        """Save generated samples and track prompts.
+        
+        Args:
+            samples: List of generated image arrays
+            pos_prompt: Positive prompt used for generation
+            neg_prompt: Negative prompt used for generation
+            
+        Saves:
+        - Generated images as PNG files
+        - CSV file tracking prompts used for each image
+        """
         file_stem = self.loop_ctx["file_stem"]
         assert len(samples) == self.args.n_samples
         for i, sample in enumerate(samples):
