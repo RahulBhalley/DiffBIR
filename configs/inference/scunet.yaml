@@ -1,5 +1,10 @@
+# Configuration for SCUNet model
 target: diffbir.model.SCUNet
 params:
+  # Number of input channels (RGB)
   in_nc: 3
+  # Configuration for network architecture
+  # Each number represents the number of blocks at each scale level
   config: [4,4,4,4,4,4,4]
+  # Base dimension (number of feature channels)
   dim: 64

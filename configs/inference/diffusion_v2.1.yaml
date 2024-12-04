@@ -1,7 +1,13 @@
+# Configuration for Diffusion model
 target: diffbir.model.Diffusion
 params:
+  # Starting value for linear noise schedule
   linear_start: 0.00085
+  # Ending value for linear noise schedule
   linear_end: 0.0120
+  # Number of diffusion timesteps
   timesteps: 1000
+  # Whether to use zero SNR (Signal-to-Noise Ratio)
   zero_snr: True
+  # Type of noise parameterization ('v' for velocity)
   parameterization: v

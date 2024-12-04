@@ -1,16 +1,31 @@
+# Configuration for SwinIR model
 target: diffbir.model.SwinIR
 params:
+  # Input image size
   img_size: 64
+  # Size of each patch for tokenization
   patch_size: 1
+  # Number of input channels (RGB)
   in_chans: 3
+  # Dimension of embedding features
   embed_dim: 180
+  # Number of transformer blocks at each stage
   depths: [6, 6, 6, 6, 6, 6, 6, 6]
+  # Number of attention heads at each stage
   num_heads: [6, 6, 6, 6, 6, 6, 6, 6]
+  # Size of sliding window for attention
   window_size: 8
+  # Expansion ratio for MLP layers
   mlp_ratio: 2
+  # Scale factor for upsampling
   sf: 8
+  # Range of input image values
   img_range: 1.0
+  # Type of upsampling method
   upsampler: "nearest+conv"
+  # Type of residual connection
   resi_connection: "1conv"
+  # Whether to use unshuffling
   unshuffle: True
+  # Scale factor for unshuffling
   unshuffle_scale: 8

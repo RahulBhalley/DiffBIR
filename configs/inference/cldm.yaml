@@ -1,6 +1,10 @@
+# Configuration for Controlled Latent Diffusion Model
 target: diffbir.model.ControlLDM
 params:
+  # Scale factor for latent space
   latent_scale_factor: 0.18215
+  
+  # U-Net model configuration
   unet_cfg:
     use_checkpoint: True
     image_size: 32 # unused
@@ -16,6 +20,8 @@ params:
     transformer_depth: 1
     context_dim: 1024
     legacy: False
+
+  # Variational Autoencoder configuration  
   vae_cfg:
     embed_dim: 4
     ddconfig:
@@ -33,14 +39,18 @@ params:
       num_res_blocks: 2
       attn_resolutions: []
       dropout: 0.0
+
+  # CLIP model configuration
   clip_cfg:
     embed_dim: 1024
+    # Vision transformer settings
     vision_cfg:
       image_size: 224
       layers: 32
       width: 1280
       head_width: 80
       patch_size: 14
+    # Text transformer settings  
     text_cfg:
       context_length: 77
       vocab_size: 49408
@@ -48,6 +58,8 @@ params:
       heads: 16
       layers: 24
     layer: "penultimate"
+
+  # ControlNet configuration
   controlnet_cfg:
     use_checkpoint: True
     image_size: 32 # unused

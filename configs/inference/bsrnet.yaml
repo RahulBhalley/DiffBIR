@@ -1,8 +1,15 @@
+# Configuration for RRDBNet model
 target: diffbir.model.RRDBNet
 params:
+  # Number of input channels (RGB)
   in_nc: 3
+  # Number of output channels (RGB)
   out_nc: 3
+  # Number of feature channels
   nf: 64
+  # Number of RRDB blocks
   nb: 23
+  # Growth channels for dense connections
   gc: 32
+  # Scale factor for upsampling
   sf: 4
