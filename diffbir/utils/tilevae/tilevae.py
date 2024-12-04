@@ -1,53 +1,40 @@
-'''
-# ------------------------------------------------------------------------
-#
-#   Tiled VAE
-#
-#   Introducing a revolutionary new optimization designed to make
-#   the VAE work with giant images on limited VRAM!
-#   Say goodbye to the frustration of OOM and hello to seamless output!
-#
-# ------------------------------------------------------------------------
-#
-#   This script is a wild hack that splits the image into tiles,
-#   encodes each tile separately, and merges the result back together.
-#
-#   Advantages:
-#   - The VAE can now work with giant images on limited VRAM
-#       (~10 GB for 8K images!)
-#   - The merged output is completely seamless without any post-processing.
-#
-#   Drawbacks:
-#   - NaNs always appear in for 8k images when you use fp16 (half) VAE
-#       You must use --no-half-vae to disable half VAE for that giant image.
-#   - The gradient calculation is not compatible with this hack. It
-#       will break any backward() or torch.autograd.grad() that passes VAE.
-#       (But you can still use the VAE to generate training data.)
-#
-#   How it works:
-#   1. The image is split into tiles, which are then padded with 11/32 pixels' in the decoder/encoder.
-#   2. When Fast Mode is disabled:
-#       1. The original VAE forward is decomposed into a task queue and a task worker, which starts to process each tile.
-#       2. When GroupNorm is needed, it suspends, stores current GroupNorm mean and var, send everything to RAM, and turns to the next tile.
-#       3. After all GroupNorm means and vars are summarized, it applies group norm to tiles and continues. 
-#       4. A zigzag execution order is used to reduce unnecessary data transfer.
-#   3. When Fast Mode is enabled:
-#       1. The original input is downsampled and passed to a separate task queue.
-#       2. Its group norm parameters are recorded and used by all tiles' task queues.
-#       3. Each tile is separately processed without any RAM-VRAM data transfer.
-#   4. After all tiles are processed, tiles are written to a result buffer and returned.
-#   Encoder color fix = only estimate GroupNorm before downsampling, i.e., run in a semi-fast mode.
-#
-#   Enjoy!
-#
-#   @Author: LI YI @ Nanyang Technological University - Singapore
-#   @Date: 2023-03-02
-#   @License: CC BY-NC-SA 4.0
-#
-#   Please give me a star if you like this project!
-#
-# -------------------------------------------------------------------------
-'''
+"""
+Tiled VAE - Optimize VAE to work with giant images on limited VRAM.
+
+This module implements a tiled approach to running VAE inference on large images
+by splitting them into tiles, processing each tile separately, and merging the
+results seamlessly.
+
+Key Features:
+    - Enables VAE processing of giant images (~8K) with limited VRAM (~10GB)
+    - Produces seamless output without visible tile boundaries
+    - Supports both fast and accurate modes
+
+Implementation Details:
+    1. Images are split into tiles with padding of 11/32 pixels for decoder/encoder
+    2. Two processing modes are supported:
+        - Accurate Mode:
+            - Decomposes VAE forward pass into task queue and worker
+            - Handles GroupNorm by computing stats across all tiles
+            - Uses zigzag execution to minimize data transfers
+        - Fast Mode:
+            - Downsamples input for global GroupNorm parameters
+            - Processes tiles independently without RAM-VRAM transfers
+    3. Results are merged into final output buffer
+
+Limitations:
+    - NaN values occur with fp16 VAE on 8K images (use --no-half-vae)
+    - Not compatible with gradient calculation/backpropagation
+
+Author:
+    LI YI @ Nanyang Technological University - Singapore
+
+Created:
+    2023-03-02
+
+License:
+    CC BY-NC-SA 4.0
+"""
 
 import math
 from tqdm import tqdm
@@ -60,21 +47,47 @@ from .attn import get_attn_func
 
 
 class NansException(Exception):
+    """Exception raised when NaN values are detected during processing."""
     pass
 
 
-def test_for_nans(x, where):
-    if not torch.isnan(x[(0, ) * len(x.shape)]):
+def test_for_nans(x: torch.Tensor, where: str) -> None:
+    """
+    Test tensor for presence of NaN values.
+
+    Args:
+        x: Input tensor to check
+        where: String describing where in processing the check is occurring
+
+    Raises:
+        NansException: If NaN values are found in the tensor
+    """
+    if not torch.isnan(x[(0,) * len(x.shape)]):
         return
     raise NansException(where)
 
 
-def inplace_nonlinearity(x):
-    # Test: fix for Nans
+def inplace_nonlinearity(x: torch.Tensor) -> torch.Tensor:
+    """
+    Apply SiLU activation function inplace.
+
+    Args:
+        x: Input tensor
+
+    Returns:
+        Tensor with SiLU activation applied
+    """
     return F.silu(x, inplace=True)
 
 
-def attn2task(task_queue, net):
+def attn2task(task_queue: list, net) -> None:
+    """
+    Convert attention block to sequence of tasks.
+
+    Args:
+        task_queue: List to append tasks to
+        net: Network containing attention block
+    """
     attn_forward = get_attn_func()
     task_queue.append(('store_res', lambda x: x))
     task_queue.append(('pre_norm', net.norm))
@@ -82,13 +95,13 @@ def attn2task(task_queue, net):
     task_queue.append(['add_res', None])
 
 
-def resblock2task(queue, block):
+def resblock2task(queue: list, block) -> None:
     """
-    Turn a ResNetBlock into a sequence of tasks and append to the task queue
+    Convert ResNet block to sequence of tasks.
 
-    @param queue: the target task queue
-    @param block: ResNetBlock
-
+    Args:
+        queue: List to append tasks to
+        block: ResNetBlock to convert
     """
     if block.in_channels != block.out_channels:
         if block.use_conv_shortcut:
@@ -106,12 +119,14 @@ def resblock2task(queue, block):
     queue.append(['add_res', None])
 
 
-def build_sampling(task_queue, net, is_decoder):
+def build_sampling(task_queue: list, net, is_decoder: bool) -> None:
     """
-    Build the sampling part of a task queue
-    @param task_queue: the target task queue
-    @param net: the network
-    @param is_decoder: currently building decoder or encoder
+    Build sampling portion of task queue.
+
+    Args:
+        task_queue: List to append tasks to
+        net: Network to build sampling for
+        is_decoder: Whether building decoder (True) or encoder (False)
     """
     if is_decoder:
         resblock2task(task_queue, net.mid.block_1)
@@ -141,18 +156,20 @@ def build_sampling(task_queue, net, is_decoder):
         resblock2task(task_queue, net.mid.block_2)
 
 
-def build_task_queue(net, is_decoder):
+def build_task_queue(net, is_decoder: bool) -> list:
     """
-    Build a single task queue for the encoder or decoder
-    @param net: the VAE decoder or encoder network
-    @param is_decoder: currently building decoder or encoder
-    @return: the task queue
+    Build complete task queue for encoder or decoder.
+
+    Args:
+        net: VAE encoder or decoder network
+        is_decoder: Whether building decoder (True) or encoder (False)
+
+    Returns:
+        List of tasks representing the processing sequence
     """
     task_queue = []
     task_queue.append(('conv_in', net.conv_in))
 
-    # construct the sampling part of the task queue
-    # because encoder and decoder share the same architecture, we extract the sampling part
     build_sampling(task_queue, net, is_decoder)
 
     if not is_decoder or not net.give_pre_end:
@@ -165,18 +182,30 @@ def build_task_queue(net, is_decoder):
     return task_queue
 
 
-def clone_task_queue(task_queue):
+def clone_task_queue(task_queue: list) -> list:
     """
-    Clone a task queue
-    @param task_queue: the task queue to be cloned
-    @return: the cloned task queue
+    Create deep copy of task queue.
+
+    Args:
+        task_queue: Task queue to clone
+
+    Returns:
+        New list containing copied tasks
     """
     return [[item for item in task] for task in task_queue]
 
 
-def get_var_mean(input, num_groups, eps=1e-6):
+def get_var_mean(input: torch.Tensor, num_groups: int, eps: float = 1e-6) -> tuple:
     """
-    Get mean and var for group norm
+    Calculate variance and mean for group normalization.
+
+    Args:
+        input: Input tensor
+        num_groups: Number of groups for normalization
+        eps: Small constant for numerical stability
+
+    Returns:
+        Tuple of (variance, mean) tensors
     """
     b, c = input.size(0), input.size(1)
     channel_in_group = int(c/num_groups)
@@ -185,29 +214,33 @@ def get_var_mean(input, num_groups, eps=1e-6):
     return var, mean
 
 
-def custom_group_norm(input, num_groups, mean, var, weight=None, bias=None, eps=1e-6):
+def custom_group_norm(input: torch.Tensor, num_groups: int, mean: torch.Tensor, 
+                     var: torch.Tensor, weight: torch.Tensor = None, 
+                     bias: torch.Tensor = None, eps: float = 1e-6) -> torch.Tensor:
     """
-    Custom group norm with fixed mean and var
+    Apply group normalization with pre-computed statistics.
 
-    @param input: input tensor
-    @param num_groups: number of groups. by default, num_groups = 32
-    @param mean: mean, must be pre-calculated by get_var_mean
-    @param var: var, must be pre-calculated by get_var_mean
-    @param weight: weight, should be fetched from the original group norm
-    @param bias: bias, should be fetched from the original group norm
-    @param eps: epsilon, by default, eps = 1e-6 to match the original group norm
+    Args:
+        input: Input tensor
+        num_groups: Number of groups for normalization
+        mean: Pre-computed mean statistics
+        var: Pre-computed variance statistics
+        weight: Optional affine transform weight
+        bias: Optional affine transform bias
+        eps: Small constant for numerical stability
 
-    @return: normalized tensor
+    Returns:
+        Normalized tensor
     """
     b, c = input.size(0), input.size(1)
     channel_in_group = int(c/num_groups)
     input_reshaped = input.contiguous().view(
         1, int(b * num_groups), channel_in_group, *input.size()[2:])
 
-    out = F.batch_norm(input_reshaped, mean.to(input), var.to(input), weight=None, bias=None, training=False, momentum=0, eps=eps)
+    out = F.batch_norm(input_reshaped, mean.to(input), var.to(input), 
+                      weight=None, bias=None, training=False, momentum=0, eps=eps)
     out = out.view(b, c, *input.size()[2:])
 
-    # post affine transform
     if weight is not None:
         out *= weight.view(1, -1, 1, 1)
     if bias is not None:
@@ -215,14 +248,19 @@ def custom_group_norm(input, num_groups, mean, var, weight=None, bias=None, eps=
     return out
 
 
-def crop_valid_region(x, input_bbox, target_bbox, is_decoder):
+def crop_valid_region(x: torch.Tensor, input_bbox: list, target_bbox: list, 
+                     is_decoder: bool) -> torch.Tensor:
     """
-    Crop the valid region from the tile
-    @param x: input tile
-    @param input_bbox: original input bounding box
-    @param target_bbox: output bounding box
-    @param scale: scale factor
-    @return: cropped tile
+    Extract valid region from processed tile.
+
+    Args:
+        x: Input tile tensor
+        input_bbox: Original input bounding box coordinates [x1,x2,y1,y2]
+        target_bbox: Target output bounding box coordinates [x1,x2,y1,y2]
+        is_decoder: Whether processing decoder (True) or encoder (False)
+
+    Returns:
+        Cropped tensor containing only valid region
     """
     padded_bbox = [i * 8 if is_decoder else i//8 for i in input_bbox]
     margin = [target_bbox[i] - padded_bbox[i] for i in range(4)]
@@ -230,15 +268,39 @@ def crop_valid_region(x, input_bbox, target_bbox, is_decoder):
 
 
 class GroupNormParam:
+    """Class for computing and storing group normalization parameters across tiles.
+
+    This class accumulates statistics (mean and variance) from multiple tiles to compute
+    global group normalization parameters. It can also create group norm functions for
+    single tiles.
+
+    Attributes:
+        var_list (list): List of variance tensors from processed tiles
+        mean_list (list): List of mean tensors from processed tiles 
+        pixel_list (list): List of pixel counts from processed tiles
+        weight (torch.Tensor): Optional affine transform weight parameter
+        bias (torch.Tensor): Optional affine transform bias parameter
+    """
 
     def __init__(self):
+        """Initialize empty lists to store group norm statistics."""
         self.var_list = []
         self.mean_list = []
         self.pixel_list = []
         self.weight = None
         self.bias = None
 
-    def add_tile(self, tile, layer):
+    def add_tile(self, tile: torch.Tensor, layer: torch.nn.Module) -> None:
+        """Add statistics from a new tile.
+
+        Computes mean and variance for the tile and stores them along with the tile's
+        pixel count. For giant images where float16 variance may overflow, converts to
+        float32 first.
+
+        Args:
+            tile: Input tensor tile to compute statistics for
+            layer: Layer containing optional affine parameters
+        """
         var, mean = get_var_mean(tile, 32)
         # For giant images, the variance can be larger than max float16
         # In this case we create a copy to float32
@@ -260,10 +322,16 @@ class GroupNormParam:
             self.weight = None
             self.bias = None
 
-    def summary(self):
-        """
-        summarize the mean and var and return a function
-        that apply group norm on each tile
+    def summary(self) -> Optional[Callable]:
+        """Compute global normalization parameters and return normalization function.
+
+        Combines the stored statistics from all tiles, weighted by their pixel counts,
+        to compute global mean and variance. Returns a function that applies group
+        normalization using these global parameters.
+
+        Returns:
+            Callable that applies group norm with the computed parameters, or None if
+            no tiles were processed
         """
         if len(self.var_list) == 0: return None
 
@@ -278,9 +346,19 @@ class GroupNormParam:
         return lambda x:  custom_group_norm(x, 32, mean, var, self.weight, self.bias)
 
     @staticmethod
-    def from_tile(tile, norm):
-        """
-        create a function from a single tile without summary
+    def from_tile(tile: torch.Tensor, norm: torch.nn.Module) -> Callable:
+        """Create a group norm function from statistics of a single tile.
+
+        Computes mean and variance from a single tile and returns a function that
+        applies group normalization using these parameters. Handles float16 overflow
+        by converting to float32 when needed.
+
+        Args:
+            tile: Input tensor tile to compute statistics from
+            norm: Module containing optional affine parameters
+
+        Returns:
+            Callable that applies group norm with the computed parameters
         """
         var, mean = get_var_mean(tile, 32)
         if var.dtype == torch.float16 and var.isinf().any():
@@ -305,8 +383,33 @@ class GroupNormParam:
 
 
 class VAEHook:
+    """Hook class for tiled VAE processing of large images.
 
-    def __init__(self, net, tile_size, is_decoder:bool, fast_decoder:bool, fast_encoder:bool, color_fix:bool):
+    This class implements tiled processing for VAE encoder/decoder to handle images
+    too large to process at once. It splits images into tiles with padding,
+    processes each tile separately, and merges results seamlessly.
+
+    Attributes:
+        net (torch.nn.Module): VAE encoder or decoder network
+        tile_size (int): Size of tiles to split image into
+        is_decoder (bool): Whether processing decoder (True) or encoder (False)
+        fast_mode (bool): Whether to use fast approximate mode
+        color_fix (bool): Whether to apply color correction for encoder
+        pad (int): Padding size for tiles (11 for decoder, 32 for encoder)
+    """
+
+    def __init__(self, net: torch.nn.Module, tile_size: int, is_decoder: bool, 
+                 fast_decoder: bool, fast_encoder: bool, color_fix: bool):
+        """Initialize VAE hook with processing parameters.
+
+        Args:
+            net: VAE encoder or decoder network
+            tile_size: Size of tiles to split image into
+            is_decoder: Whether processing decoder (True) or encoder (False)
+            fast_decoder: Whether to use fast mode for decoder
+            fast_encoder: Whether to use fast mode for encoder
+            color_fix: Whether to apply color correction for encoder
+        """
         self.net = net                  # encoder | decoder
         self.tile_size = tile_size
         self.is_decoder = is_decoder
@@ -314,7 +417,15 @@ class VAEHook:
         self.color_fix = color_fix and not is_decoder
         self.pad = 11 if is_decoder else 32         # FIXME: magic number
 
-    def __call__(self, x):
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """Process input tensor using tiled approach if needed.
+
+        Args:
+            x: Input tensor to process
+
+        Returns:
+            Processed tensor, either directly or via tiled processing
+        """
         B, C, H, W = x.shape
         if max(H, W) <= self.pad * 2 + self.tile_size:
             print("[Tiled VAE]: the input size is tiny and unnecessary to tile.")
@@ -322,9 +433,15 @@ class VAEHook:
         else:
             return self.vae_tile_forward(x)
 
-    def get_best_tile_size(self, lowerbound, upperbound):
-        """
-        Get the best tile size for GPU memory
+    def get_best_tile_size(self, lowerbound: int, upperbound: int) -> int:
+        """Find optimal tile size that's divisible by largest possible power of 2.
+
+        Args:
+            lowerbound: Minimum acceptable tile size
+            upperbound: Maximum acceptable tile size
+
+        Returns:
+            Optimal tile size between bounds that's divisible by largest possible power of 2
         """
         divider = 32
         while divider >= 2:
@@ -337,12 +454,19 @@ class VAEHook:
             divider //= 2
         return lowerbound
 
-    def split_tiles(self, h, w):
-        """
-        Tool function to split the image into tiles
-        @param h: height of the image
-        @param w: width of the image
-        @return: tile_input_bboxes, tile_output_bboxes
+    def split_tiles(self, h: int, w: int) -> Tuple[List[List[int]], List[List[int]]]:
+        """Split image into tiles with padding.
+
+        Computes optimal tile sizes and generates input/output bounding boxes for each tile.
+
+        Args:
+            h: Height of input image
+            w: Width of input image
+
+        Returns:
+            Tuple containing:
+                - List of input tile bounding boxes [x1,x2,y1,y2]
+                - List of output tile bounding boxes [x1,x2,y1,y2]
         """
         tile_input_bboxes, tile_output_bboxes = [], []
         tile_size = self.tile_size
@@ -397,7 +521,20 @@ class VAEHook:
         return tile_input_bboxes, tile_output_bboxes
 
     @torch.no_grad()
-    def estimate_group_norm(self, z, task_queue, color_fix):
+    def estimate_group_norm(self, z: torch.Tensor, task_queue: List[Tuple], color_fix: bool) -> bool:
+        """Estimate group norm parameters from downsampled input in fast mode.
+
+        Args:
+            z: Input tensor
+            task_queue: Queue of processing tasks
+            color_fix: Whether to apply color correction
+
+        Returns:
+            bool indicating if estimation succeeded
+
+        Raises:
+            ValueError: If no group norm task found in queue
+        """
         device = z.device
         tile = z
         last_id = len(task_queue) - 1
@@ -440,11 +577,20 @@ class VAEHook:
         raise IndexError('Should not reach here')
 
     @torch.no_grad()
-    def vae_tile_forward(self, z):
-        """
-        Decode a latent vector z into an image in a tiled manner.
-        @param z: latent vector
-        @return: image
+    def vae_tile_forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Process input tensor in tiled manner.
+
+        Splits input into tiles, processes each tile with appropriate padding and
+        normalization, then merges results seamlessly.
+
+        Args:
+            z: Input tensor to process
+
+        Returns:
+            Processed tensor
+
+        Raises:
+            NansException: If NaN values detected during processing
         """
         device = next(self.net.parameters()).device
         dtype = next(self.net.parameters()).dtype

@@ -23,6 +23,15 @@ from .model import ControlLDM, Diffusion, RRDBNet
 
 
 def resize_short_edge_to(imgs: torch.Tensor, size: int) -> torch.Tensor:
+    """Resize images preserving aspect ratio so shortest edge matches target size.
+
+    Args:
+        imgs (torch.Tensor): Input images tensor of shape (B, C, H, W)
+        size (int): Target size for shortest edge
+
+    Returns:
+        torch.Tensor: Resized images tensor with shortest edge = size
+    """
     _, _, h, w = imgs.size()
     if h == w:
         out_h, out_w = size, size
@@ -35,6 +44,15 @@ def resize_short_edge_to(imgs: torch.Tensor, size: int) -> torch.Tensor:
 
 
 def pad_to_multiples_of(imgs: torch.Tensor, multiple: int) -> torch.Tensor:
+    """Pad images with zeros to make dimensions multiples of given number.
+
+    Args:
+        imgs (torch.Tensor): Input images tensor of shape (B, C, H, W)
+        multiple (int): Number that dimensions should be multiples of
+
+    Returns:
+        torch.Tensor: Zero-padded images tensor with dimensions as multiples of multiple
+    """
     _, _, h, w = imgs.size()
     if h % multiple == 0 and w % multiple == 0:
         return imgs.clone()
@@ -43,6 +61,25 @@ def pad_to_multiples_of(imgs: torch.Tensor, multiple: int) -> torch.Tensor:
 
 
 class Pipeline:
+    """Main pipeline for blind image restoration using diffusion models.
+
+    This class orchestrates the full restoration process by combining:
+    1. A cleaner network for initial image enhancement
+    2. A ControlNet-guided latent diffusion model for final restoration
+    3. Optional guidance functions to steer the diffusion process
+
+    Args:
+        cleaner (nn.Module): First-stage cleaner network (e.g. RRDB)
+        cldm (ControlLDM): ControlNet-guided latent diffusion model
+        diffusion (Diffusion): Diffusion model configuration and utilities
+        cond_fn (Guidance, optional): Guidance function for controlled sampling
+        device (str): Device to run pipeline on ('cuda' or 'cpu')
+
+    Note:
+        The pipeline follows a two-stage approach:
+        1. Initial cleaning using a conventional CNN
+        2. Refinement using a guided diffusion model
+    """
 
     def __init__(
         self,
@@ -60,6 +97,11 @@ class Pipeline:
         self.output_size: Tuple[int, int] = None
 
     def set_output_size(self, lq_size: Tuple[int]) -> None:
+        """Set target output size based on input image dimensions.
+
+        Args:
+            lq_size (Tuple[int]): Input tensor shape (B,C,H,W)
+        """
         h, w = lq_size[2:]
         self.output_size = (h, w)
 
@@ -94,6 +136,44 @@ class Pipeline:
         eta: float,
         order: int,
     ) -> torch.Tensor:
+        """Apply ControlNet-guided latent diffusion model for image restoration.
+
+        Args:
+            cond_img (torch.Tensor): Condition image from first stage
+            steps (int): Number of diffusion sampling steps
+            strength (float): Control strength for ControlNet guidance
+            vae_encoder_tiled (bool): Whether to use tiled VAE encoding
+            vae_encoder_tile_size (int): Tile size for VAE encoder
+            vae_decoder_tiled (bool): Whether to use tiled VAE decoding  
+            vae_decoder_tile_size (int): Tile size for VAE decoder
+            cldm_tiled (bool): Whether to use tiled diffusion inference
+            cldm_tile_size (int): Tile size for diffusion model
+            cldm_tile_stride (int): Stride between tiles
+            pos_prompt (str): Positive text prompt
+            neg_prompt (str): Negative text prompt
+            cfg_scale (float): Classifier-free guidance scale
+            start_point_type (str): Starting point type ('cond' or 'random')
+            sampler_type (str): Sampler algorithm to use
+            noise_aug (int): Noise augmentation strength
+            rescale_cfg (bool): Whether to rescale classifier-free guidance
+            s_churn (float): Stochastic sampling parameter
+            s_tmin (float): Minimum timestep for stochastic sampling
+            s_tmax (float): Maximum timestep for stochastic sampling
+            s_noise (float): Noise level for stochastic sampling
+            eta (float): DDIM eta parameter
+            order (int): DPM-Solver order
+
+        Returns:
+            torch.Tensor: Restored image tensor
+
+        Note:
+            The function handles:
+            1. VAE encoding of condition image
+            2. Preparing unconditional and conditional inputs
+            3. Setting up sampling parameters and noise
+            4. Running the selected sampler
+            5. VAE decoding of generated latents
+        """
         bs, _, h0, w0 = cond_img.shape
         # 1. Pad condition image for VAE encoding (scale factor = 8)
         # 1.1 Whether or not tiled inference is used, the input image size for the VAE must be a multiple of 8.
@@ -262,6 +342,48 @@ class Pipeline:
         eta: float,
         order: int,
     ) -> np.ndarray:
+        """Run the full restoration pipeline on a low quality image.
+
+        This method orchestrates the complete restoration process by:
+        1. Converting input to tensor and applying the cleaner network
+        2. Using the cleaned image as condition for the ControlNet-guided diffusion
+        3. Post-processing the result with wavelet reconstruction
+
+        Args:
+            lq (np.ndarray): Low quality input image array of shape (B,H,W,C)
+            steps (int): Number of denoising steps for diffusion sampling
+            strength (float): Strength of diffusion noise, higher means more variation
+            cleaner_tiled (bool): Whether to run cleaner in tiled mode
+            cleaner_tile_size (int): Tile size for cleaner when tiled=True
+            cleaner_tile_stride (int): Stride between tiles for cleaner
+            vae_encoder_tiled (bool): Whether to run VAE encoder in tiled mode
+            vae_encoder_tile_size (int): Tile size for VAE encoder
+            vae_decoder_tiled (bool): Whether to run VAE decoder in tiled mode
+            vae_decoder_tile_size (int): Tile size for VAE decoder
+            cldm_tiled (bool): Whether to run ControlNet-LDM in tiled mode
+            cldm_tile_size (int): Tile size for CLDM
+            cldm_tile_stride (int): Stride between tiles for CLDM
+            pos_prompt (str): Positive text prompt to guide restoration
+            neg_prompt (str): Negative text prompt to avoid certain attributes
+            cfg_scale (float): Classifier-free guidance scale
+            start_point_type (str): Type of starting point for diffusion
+            sampler_type (str): Type of diffusion sampler to use
+            noise_aug (int): Amount of noise augmentation
+            rescale_cfg (bool): Whether to rescale classifier-free guidance
+            s_churn (float): Stochastic sampling parameter for EDM sampler
+            s_tmin (float): Minimum timestep for EDM stochastic sampling
+            s_tmax (float): Maximum timestep for EDM stochastic sampling
+            s_noise (float): Noise level for EDM sampler
+            eta (float): Eta parameter for DDIM sampler
+            order (int): Order for DPM-Solver sampler
+
+        Returns:
+            np.ndarray: Restored image array of shape (B,H,W,C) with uint8 values
+
+        Note:
+            The input image resolution after stage 1 (cleaner) must be at least
+            512x512 since it will be used as condition for stage 2 (CLDM).
+        """
         lq_tensor = (
             torch.tensor(lq, dtype=torch.float32, device=self.device)
             .div(255)
@@ -322,6 +444,23 @@ class Pipeline:
 
 
 class BSRNetPipeline(Pipeline):
+    """Pipeline for blind image restoration using BSRNet as the cleaner network.
+
+    This pipeline uses BSRNet (Blind Super-Resolution Network) as the first-stage cleaner,
+    followed by a ControlNet-guided diffusion model for final restoration. BSRNet provides
+    initial upscaling and enhancement.
+
+    Args:
+        cleaner (RRDBNet): BSRNet cleaner network using RRDB blocks
+        cldm (ControlLDM): ControlNet-guided latent diffusion model
+        diffusion (Diffusion): Diffusion model configuration
+        cond_fn (Guidance | None): Optional guidance function for controlled sampling
+        device (str): Device to run pipeline on ('cuda' or 'cpu')
+        upscale (float): Target upscaling factor for final output
+
+    Note:
+        BSRNet internally upscales by 4x, then resizes to target size if needed.
+    """
 
     def __init__(
         self,
@@ -336,12 +475,33 @@ class BSRNetPipeline(Pipeline):
         self.upscale = upscale
 
     def set_output_size(self, lq_size: Tuple[int]) -> None:
+        """Set target output size based on input size and upscale factor.
+
+        Args:
+            lq_size (Tuple[int]): Input tensor size (B, C, H, W)
+        """
         h, w = lq_size[2:]
         self.output_size = (int(h * self.upscale), int(w * self.upscale))
 
     def apply_cleaner(
         self, lq: torch.Tensor, tiled: bool, tile_size: int, tile_stride: int
     ) -> torch.Tensor:
+        """Apply BSRNet cleaner to low quality input.
+
+        Args:
+            lq (torch.Tensor): Low quality input tensor (B, C, H, W)
+            tiled (bool): Whether to process in tiles
+            tile_size (int): Size of tiles if using tiled processing
+            tile_stride (int): Stride between tiles if using tiled processing
+
+        Returns:
+            torch.Tensor: Enhanced output tensor
+
+        Note:
+            - Disables tiling if input is smaller than tile_size
+            - Always upscales by 4x internally
+            - Resizes to at least 512px on shortest edge
+        """
         if tiled and (lq.size(2) < tile_size or lq.size(3) < tile_size):
             print("[BSRNet]: the input size is tiny and unnecessary to tile.")
             tiled = False
@@ -367,10 +527,37 @@ class BSRNetPipeline(Pipeline):
 
 
 class SwinIRPipeline(Pipeline):
+    """Pipeline for blind image restoration using SwinIR as the cleaner network.
+
+    This pipeline uses SwinIR (Swin Transformer for Image Restoration) as the first-stage
+    cleaner, followed by a ControlNet-guided diffusion model for final restoration.
+
+    Note:
+        SwinIR requires input dimensions to be multiples of 64.
+    """
 
     def apply_cleaner(
         self, lq: torch.Tensor, tiled: bool, tile_size: int, tile_stride: int
     ) -> torch.Tensor:
+        """Apply SwinIR cleaner to low quality input.
+
+        Args:
+            lq (torch.Tensor): Low quality input tensor (B, C, H, W)
+            tiled (bool): Whether to process in tiles
+            tile_size (int): Size of tiles if using tiled processing
+            tile_stride (int): Stride between tiles if using tiled processing
+
+        Returns:
+            torch.Tensor: Enhanced output tensor
+
+        Raises:
+            ValueError: If tile_size is not a multiple of 64
+
+        Note:
+            - Disables tiling if input is smaller than tile_size
+            - Pads input to multiples of 64 when not using tiling
+            - Resizes to at least 512px on shortest edge
+        """
         if tiled and (lq.size(2) < tile_size or lq.size(3) < tile_size):
             print("[SwinIR]: the input size is tiny and unnecessary to tile.")
             tiled = False
@@ -398,10 +585,30 @@ class SwinIRPipeline(Pipeline):
 
 
 class SCUNetPipeline(Pipeline):
+    """Pipeline for blind image restoration using SCUNet as the cleaner network.
+
+    This pipeline uses SCUNet (Skip-Connected U-Net) as the first-stage cleaner,
+    followed by a ControlNet-guided diffusion model for final restoration.
+    """
 
     def apply_cleaner(
         self, lq: torch.Tensor, tiled: bool, tile_size: int, tile_stride: int
     ) -> torch.Tensor:
+        """Apply SCUNet cleaner to low quality input.
+
+        Args:
+            lq (torch.Tensor): Low quality input tensor (B, C, H, W)
+            tiled (bool): Whether to process in tiles
+            tile_size (int): Size of tiles if using tiled processing
+            tile_stride (int): Stride between tiles if using tiled processing
+
+        Returns:
+            torch.Tensor: Enhanced output tensor
+
+        Note:
+            - Disables tiling if input is smaller than tile_size
+            - Resizes output to at least 512px on shortest edge
+        """
         if tiled and (lq.size(2) < tile_size or lq.size(3) < tile_size):
             print("[SCUNet]: the input size is tiny and unnecessary to tile.")
             tiled = False

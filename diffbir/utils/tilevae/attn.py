@@ -1,7 +1,16 @@
-'''
-    This file is modified from the sd_hijack_optimizations.py to remove the residual and norm part,
-    So that the Tiled VAE can support other types of attention.
-'''
+"""
+Attention implementations for Tiled VAE.
+
+This module provides different attention implementations that can be used with Tiled VAE.
+The implementations are modified from sd_hijack_optimizations.py to remove residual connections
+and normalization, allowing Tiled VAE to support different types of attention mechanisms.
+
+Functions:
+    get_attn_func(): Returns the appropriate attention function based on config
+    forward(x): Basic attention implementation using matrix multiplication
+    xformers_forward(x): Memory-efficient attention using xformers library
+    sdp_forward(x): Attention using PyTorch's scaled dot product attention
+"""
 import torch
 from torch.nn import functional as F
 from einops import rearrange
@@ -10,18 +19,28 @@ from ...model.config import Config, AttnMode
 
 
 def get_attn_func():
+    """Returns the configured attention function.
+    
+    Returns:
+        callable: One of forward(), xformers_forward(), or sdp_forward() based on Config.attn_mode
+    """
     return {
         AttnMode.VANILLA: forward,
         AttnMode.XFORMERS: xformers_forward,
         AttnMode.SDP: sdp_forward,
     }[Config.attn_mode]
 
-# The following functions are all copied from modules.sd_hijack_optimizations
-# However, the residual & normalization are removed and computed separately.
 
 def forward(self, x):
+    """Basic attention implementation using matrix multiplication.
+    
+    Args:
+        x (torch.Tensor): Input tensor of shape [B, C, H, W]
+        
+    Returns:
+        torch.Tensor: Attention output of shape [B, C, H, W]
+    """
     h_ = x
-    # h_ = self.norm(h_)
     q = self.q(h_)
     k = self.k(h_)
     v = self.v(h_)
@@ -42,14 +61,19 @@ def forward(self, x):
     h_ = h_.reshape(b, c, h, w)
 
     h_ = self.proj_out(h_)
-
-    # return x + h_
     return h_
 
 
 def xformers_forward(self, x):
+    """Memory-efficient attention implementation using xformers library.
+    
+    Args:
+        x (torch.Tensor): Input tensor of shape [B, C, H, W]
+        
+    Returns:
+        torch.Tensor: Attention output of shape [B, C, H, W]
+    """
     h_ = x
-    # h_ = self.norm(h_)
     q = self.q(h_)
     k = self.k(h_)
     v = self.v(h_)
@@ -78,13 +102,19 @@ def xformers_forward(self, x):
     )
     out = rearrange(out, "b (h w) c -> b c h w", b=B, h=H, w=W, c=C)
     out = self.proj_out(out)
-    # return x + out
     return out
 
 
 def sdp_forward(self, x):
+    """Attention implementation using PyTorch's scaled dot product attention.
+    
+    Args:
+        x (torch.Tensor): Input tensor of shape [B, C, H, W]
+        
+    Returns:
+        torch.Tensor: Attention output of shape [B, C, H, W]
+    """
     h_ = x
-    # h_ = self.norm(h_)
     q = self.q(h_)
     k = self.k(h_)
     v = self.v(h_)
@@ -111,5 +141,4 @@ def sdp_forward(self, x):
     )
     out = rearrange(out, "b (h w) c -> b c h w", b=B, h=H, w=W, c=C)
     out = self.proj_out(out)
-    # return x + out
     return out

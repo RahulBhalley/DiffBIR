@@ -11,8 +11,32 @@ from facexlib.utils.misc import img2tensor, imwrite
 from .common import load_file_from_url
 
 def get_largest_face(det_faces, h, w):
+    """Find the largest face bounding box from detected faces.
 
+    Args:
+        det_faces (list): List of detected face bounding boxes, each containing
+            [left, top, right, bottom] coordinates.
+        h (int): Height of the original image.
+        w (int): Width of the original image.
+
+    Returns:
+        tuple: A tuple containing:
+            - list: The bounding box coordinates of the largest face [left, top, right, bottom]
+            - int: Index of the largest face in the input list
+
+    Note:
+        Coordinates are clamped to image boundaries (0 to width/height).
+    """
     def get_location(val, length):
+        """Clamp coordinate value within image boundaries.
+
+        Args:
+            val (float): Coordinate value to clamp
+            length (int): Maximum boundary (width or height)
+
+        Returns:
+            int: Clamped coordinate value between 0 and length
+        """
         if val < 0:
             return 0
         elif val > length:
@@ -33,6 +57,21 @@ def get_largest_face(det_faces, h, w):
 
 
 def get_center_face(det_faces, h=0, w=0, center=None):
+    """Find the face closest to the center of the image.
+
+    Args:
+        det_faces (list): List of detected face bounding boxes, each containing
+            [left, top, right, bottom] coordinates.
+        h (int, optional): Height of the image. Defaults to 0.
+        w (int, optional): Width of the image. Defaults to 0.
+        center (tuple, optional): Custom center point (x,y). If None, uses image center.
+            Defaults to None.
+
+    Returns:
+        tuple: A tuple containing:
+            - list: The bounding box coordinates of the most central face
+            - int: Index of the most central face in the input list
+    """
     if center is not None:
         center = np.array(center)
     else:
@@ -47,7 +86,36 @@ def get_center_face(det_faces, h=0, w=0, center=None):
 
 
 class FaceRestoreHelper(object):
-    """Helper for the face restoration pipeline (base class)."""
+    """Helper class for face detection, alignment and restoration.
+
+    This class provides functionality for:
+    1. Face detection using different models (RetinaFace, dlib)
+    2. Face alignment using 5-point or 3-point landmarks
+    3. Face cropping and restoration
+    4. Optional face parsing
+
+    Args:
+        upscale_factor (int): Factor to upscale the output image
+        face_size (int, optional): Size of the cropped face. Defaults to 512.
+        crop_ratio (tuple, optional): Crop ratio (height, width). Defaults to (1,1).
+        det_model (str, optional): Detection model name. Defaults to 'retinaface_resnet50'.
+        save_ext (str, optional): Save file extension. Defaults to 'png'.
+        template_3points (bool, optional): Use 3-point instead of 5-point template.
+            Defaults to False.
+        pad_blur (bool, optional): Apply padding blur. Defaults to False.
+        use_parse (bool, optional): Use face parsing. Defaults to False.
+        device (torch.device, optional): Device to run model on. Defaults to None.
+
+    Attributes:
+        face_template (ndarray): Landmark template for face alignment
+        all_landmarks_5 (list): Detected 5-point landmarks for all faces
+        det_faces (list): Detected face bounding boxes
+        affine_matrices (list): Affine transformation matrices
+        inverse_affine_matrices (list): Inverse affine transformation matrices
+        cropped_faces (list): Cropped face images
+        restored_faces (list): Restored face images
+        pad_input_imgs (list): Padded input images
+    """
 
     def __init__(self,
                  upscale_factor,
@@ -81,10 +149,6 @@ class FaceRestoreHelper(object):
             self.face_template = np.array([[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935],
                                            [201.26117, 371.41043], [313.08905, 371.15118]])
 
-            # dlib: left_eye: 36:41  right_eye: 42:47  nose: 30,32,33,34  left mouth corner: 48  right mouth corner: 54
-            # self.face_template = np.array([[193.65928, 242.98541], [318.32558, 243.06108], [255.67984, 328.82894],
-            #                                 [198.22603, 372.82502], [313.91018, 372.75659]])
-
         self.face_template = self.face_template * (face_size / 512.0)
         if self.crop_ratio[0] > 1:
             self.face_template[:, 1] += face_size * (self.crop_ratio[0] - 1) / 2
@@ -105,7 +169,6 @@ class FaceRestoreHelper(object):
 
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            # self.device = get_device()
         else:
             self.device = device
 
@@ -117,11 +180,25 @@ class FaceRestoreHelper(object):
         self.face_parse = init_parsing_model(model_name='parsenet', device=self.device)
 
     def set_upscale_factor(self, upscale_factor):
+        """Set the upscale factor for restoration.
+
+        Args:
+            upscale_factor (int): New upscale factor
+        """
         self.upscale_factor = upscale_factor
 
     def read_image(self, img):
-        """img can be image path or cv2 loaded image."""
-        # self.input_img is Numpy array, (h, w, c), BGR, uint8, [0, 255]
+        """Read and preprocess input image.
+
+        Args:
+            img (str or ndarray): Image path or cv2 loaded image array
+
+        Note:
+            - Converts 16-bit images to 8-bit
+            - Converts grayscale to BGR
+            - Removes alpha channel if present
+            - Resizes image if smaller than 512px
+        """
         if isinstance(img, str):
             img = cv2.imread(img)
 
@@ -133,16 +210,26 @@ class FaceRestoreHelper(object):
             img = img[:, :, 0:3]
 
         self.input_img = img
-        # self.is_gray = is_gray(img, threshold=10)
-        # if self.is_gray:
-        #     print('Grayscale input: True')
 
         if min(self.input_img.shape[:2])<512:
             f = 512.0/min(self.input_img.shape[:2])
             self.input_img = cv2.resize(self.input_img, (0,0), fx=f, fy=f, interpolation=cv2.INTER_LINEAR)
 
     def init_dlib(self, detection_path, landmark5_path):
-        """Initialize the dlib detectors and predictors."""
+        """Initialize dlib face detector and landmark predictor.
+
+        Args:
+            detection_path (str): Path to dlib face detection model
+            landmark5_path (str): Path to dlib 5-point landmark model
+
+        Returns:
+            tuple: Containing:
+                - dlib.cnn_face_detection_model_v1: Face detector
+                - dlib.shape_predictor: Landmark predictor
+
+        Raises:
+            ImportError: If dlib is not installed
+        """
         try:
             import dlib
         except ImportError:
@@ -156,6 +243,16 @@ class FaceRestoreHelper(object):
     def get_face_landmarks_5_dlib(self,
                                 only_keep_largest=False,
                                 scale=1):
+        """Detect faces and 5-point landmarks using dlib.
+
+        Args:
+            only_keep_largest (bool, optional): Only keep largest detected face.
+                Defaults to False.
+            scale (int, optional): Image scale factor. Defaults to 1.
+
+        Returns:
+            int: Number of faces detected with valid landmarks
+        """
         det_faces = self.face_detector(self.input_img, scale)
 
         if len(det_faces) == 0:
@@ -191,6 +288,39 @@ class FaceRestoreHelper(object):
                              resize=None,
                              blur_ratio=0.01,
                              eye_dist_threshold=None):
+        """Detect faces and extract 5-point landmarks.
+
+        This method detects faces in the input image and extracts 5 facial landmarks 
+        (eyes, nose, mouth corners) for each detected face. It can optionally keep only
+        the largest face or most central face, and handle image resizing and blurring.
+
+        Args:
+            only_keep_largest (bool, optional): If True, only keep the face with largest
+                bounding box. Defaults to False.
+            only_center_face (bool, optional): If True, only keep the face closest to 
+                image center. Defaults to False.
+            resize (int, optional): Target size for resizing image before detection. 
+                Image will be scaled so smallest dimension equals this value.
+                If None, no resizing is performed. Defaults to None.
+            blur_ratio (float, optional): Ratio for calculating blur kernel size when
+                padding images. Kernel size = face size * blur_ratio. 
+                Defaults to 0.01.
+            eye_dist_threshold (float, optional): Minimum required distance between eyes.
+                Faces with eye distance below this are filtered out.
+                If None, no filtering is done. Defaults to None.
+
+        Returns:
+            int: Number of faces detected with valid landmarks
+
+        Note:
+            - If self.det_model is 'dlib', delegates to get_face_landmarks_5_dlib()
+            - Detected faces and landmarks are stored in self.det_faces and 
+              self.all_landmarks_5
+            - If self.pad_blur is True, padded and blurred versions of face images
+              are stored in self.pad_input_imgs
+            - Landmarks are scaled back to original image coordinates if resizing
+              was applied
+        """
         if self.det_model == 'dlib':
             return self.get_face_landmarks_5_dlib(only_keep_largest)
 
@@ -309,7 +439,25 @@ class FaceRestoreHelper(object):
         return len(self.all_landmarks_5)
 
     def align_warp_face(self, save_cropped_path=None, border_mode='constant'):
-        """Align and warp faces with face template.
+        """Align and warp detected faces using affine transformation.
+
+        This method aligns detected faces with a face template using landmarks, warps them 
+        using affine transformation, and optionally saves the cropped faces.
+
+        Args:
+            save_cropped_path (str, optional): Path to save cropped face images. If None,
+                faces are not saved. The path will be appended with face index.
+                Defaults to None.
+            border_mode (str, optional): Border mode for warping. One of:
+                - 'constant': Fill borders with constant gray value
+                - 'reflect101': Mirror padding without repeating edge pixels 
+                - 'reflect': Mirror padding with edge pixel repetition
+                Defaults to 'constant'.
+
+        Note:
+            - Requires face landmarks to be detected first via get_face_landmarks_5()
+            - Stores results in self.affine_matrices and self.cropped_faces
+            - Uses gray border value (135,133,132) for constant border mode
         """
         if self.pad_blur:
             assert len(self.pad_input_imgs) == len(
@@ -341,7 +489,21 @@ class FaceRestoreHelper(object):
                 imwrite(cropped_face, save_path)
 
     def get_inverse_affine(self, save_inverse_affine_path=None):
-        """Get inverse affine matrix."""
+        """Calculate inverse affine transformation matrices for face restoration.
+
+        This method computes the inverse of each affine transformation matrix used for face
+        alignment, scales it by the upscale factor, and optionally saves the matrices.
+
+        Args:
+            save_inverse_affine_path (str, optional): Path to save inverse affine matrices.
+                If provided, matrices are saved as PyTorch tensors with face index appended.
+                Defaults to None.
+
+        Note:
+            - Requires align_warp_face() to be called first to generate affine matrices
+            - Stores results in self.inverse_affine_matrices
+            - Matrices are scaled by self.upscale_factor for high-res restoration
+        """
         for idx, affine_matrix in enumerate(self.affine_matrices):
             inverse_affine = cv2.invertAffineTransform(affine_matrix)
             inverse_affine *= self.upscale_factor
@@ -352,16 +514,50 @@ class FaceRestoreHelper(object):
                 save_path = f'{path}_{idx:02d}.pth'
                 torch.save(inverse_affine, save_path)
 
-
     def add_restored_face(self, restored_face, input_face=None):
+        """Add a restored face to the collection.
+
+        Args:
+            restored_face (ndarray): The restored face image to add
+            input_face (ndarray, optional): Original input face for potential color
+                transfer. Currently unused. Defaults to None.
+
+        Note:
+            Stores the restored face in self.restored_faces for later processing
+        """
         # if self.is_gray:
         #     restored_face = bgr2gray(restored_face) # convert img into grayscale
         #     if input_face is not None:
         #         restored_face = adain_npy(restored_face, input_face) # transfer the color
         self.restored_faces.append(restored_face)
 
-
     def paste_faces_to_input_image(self, save_path=None, upsample_img=None, draw_box=False, face_upsampler=None):
+        """Paste restored faces back into the original image.
+
+        This method transforms restored faces back to their original positions using inverse
+        affine matrices, blends them seamlessly with the background, and optionally draws
+        face bounding boxes.
+
+        Args:
+            save_path (str, optional): Path to save final image. If None, image is not saved.
+                Defaults to None.
+            upsample_img (ndarray, optional): Pre-upsampled background image. If None,
+                input image is upsampled using linear interpolation. Defaults to None.
+            draw_box (bool, optional): Whether to draw green bounding boxes around faces.
+                Defaults to False.
+            face_upsampler (object, optional): Face-specific upsampler for enhanced quality.
+                Must have an enhance() method. Defaults to None.
+
+        Returns:
+            ndarray: Final image with restored faces pasted in
+
+        Note:
+            - Requires restored faces and inverse affine matrices to be prepared
+            - Handles both RGB and RGBA images
+            - Uses Gaussian blending for seamless face integration
+            - Supports 8-bit and 16-bit images
+            - If using face parsing (self.use_parse=True), generates refined masks
+        """
         h, w, _ = self.input_img.shape
         h_up, w_up = int(h * self.upscale_factor), int(w * self.upscale_factor)
 
@@ -391,33 +587,6 @@ class FaceRestoreHelper(object):
                 inverse_affine[:, 2] += extra_offset
                 face_size = self.face_size
             inv_restored = cv2.warpAffine(restored_face, inverse_affine, (w_up, h_up))
-
-            # if draw_box or not self.use_parse:  # use square parse maps
-            #     mask = np.ones(face_size, dtype=np.float32)
-            #     inv_mask = cv2.warpAffine(mask, inverse_affine, (w_up, h_up))
-            #     # remove the black borders
-            #     inv_mask_erosion = cv2.erode(
-            #         inv_mask, np.ones((int(2 * self.upscale_factor), int(2 * self.upscale_factor)), np.uint8))
-            #     pasted_face = inv_mask_erosion[:, :, None] * inv_restored
-            #     total_face_area = np.sum(inv_mask_erosion)  # // 3
-            #     # add border
-            #     if draw_box:
-            #         h, w = face_size
-            #         mask_border = np.ones((h, w, 3), dtype=np.float32)
-            #         border = int(1400/np.sqrt(total_face_area))
-            #         mask_border[border:h-border, border:w-border,:] = 0
-            #         inv_mask_border = cv2.warpAffine(mask_border, inverse_affine, (w_up, h_up))
-            #         inv_mask_borders.append(inv_mask_border)
-            #     if not self.use_parse:
-            #         # compute the fusion edge based on the area of face
-            #         w_edge = int(total_face_area**0.5) // 20
-            #         erosion_radius = w_edge * 2
-            #         inv_mask_center = cv2.erode(inv_mask_erosion, np.ones((erosion_radius, erosion_radius), np.uint8))
-            #         blur_size = w_edge * 2
-            #         inv_soft_mask = cv2.GaussianBlur(inv_mask_center, (blur_size + 1, blur_size + 1), 0)
-            #         if len(upsample_img.shape) == 2:  # upsample_img is gray image
-            #             upsample_img = upsample_img[:, :, None]
-            #         inv_soft_mask = inv_soft_mask[:, :, None]
 
             # always use square mask
             mask = np.ones(face_size, dtype=np.float32)
@@ -508,6 +677,11 @@ class FaceRestoreHelper(object):
         return upsample_img
 
     def clean_all(self):
+        """Reset all internal face processing state.
+
+        Clears all stored landmarks, faces, transformation matrices and other internal
+        state to prepare for processing a new image.
+        """
         self.all_landmarks_5 = []
         self.restored_faces = []
         self.affine_matrices = []

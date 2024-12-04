@@ -1,3 +1,9 @@
+"""Image captioning utilities.
+
+This module provides classes for generating text captions from images using
+different models like LLaVA and RAM.
+"""
+
 from typing import overload, Literal
 import re
 
@@ -38,6 +44,15 @@ except Exception as e:
 
 
 class Captioner:
+    """Base class for image captioning models.
+
+    This class defines the interface that all captioning models must implement.
+    Subclasses should override the __call__ method to provide specific captioning
+    functionality.
+
+    Args:
+        device (torch.device): The device to run the model on (CPU/GPU).
+    """
 
     def __init__(self, device: torch.device) -> "Captioner":
         self.device = device
@@ -47,12 +62,34 @@ class Captioner:
 
 
 class EmptyCaptioner(Captioner):
+    """A captioner that returns an empty string.
+
+    This captioner is useful as a fallback when other captioning models are not
+    available or as a placeholder during testing.
+    """
 
     def __call__(self, image: Image.Image) -> str:
+        """Return an empty caption regardless of input.
+
+        Args:
+            image (PIL.Image.Image): The input image to caption.
+
+        Returns:
+            str: An empty string.
+        """
         return ""
 
 
 class LLaVACaptioner(Captioner):
+    """Image captioner using the LLaVA (Large Language and Vision Assistant) model.
+
+    This captioner uses LLaVA to generate natural language descriptions of images.
+    It supports different quantization levels (4-bit, 8-bit, 16-bit) for memory efficiency.
+
+    Args:
+        device (torch.device): The device to run the model on (CPU/GPU).
+        llava_bit (Literal["16", "8", "4"]): Bit precision for model quantization.
+    """
 
     def __init__(
         self, device: torch.device, llava_bit: Literal["16", "8", "4"]
@@ -121,6 +158,14 @@ class LLaVACaptioner(Captioner):
 
     @torch.no_grad()
     def __call__(self, image: Image.Image) -> str:
+        """Generate a natural language caption for the input image.
+
+        Args:
+            image (PIL.Image.Image): The input image to caption.
+
+        Returns:
+            str: A natural language description of the image.
+        """
         images = [image]
         image_sizes = [x.size for x in images]
         images_tensor = process_images(
@@ -150,6 +195,14 @@ class LLaVACaptioner(Captioner):
 
 
 class RAMCaptioner(Captioner):
+    """Image captioner using the RAM (Recognize Anything Model) Plus model.
+
+    This captioner uses the RAM Plus model to generate tag-based descriptions of images.
+    It outputs a comma-separated list of objects and concepts detected in the image.
+
+    Args:
+        device (torch.device): The device to run the model on (CPU/GPU).
+    """
 
     def __init__(self, device: torch.device) -> Captioner:
         super().__init__(device)
@@ -164,6 +217,14 @@ class RAMCaptioner(Captioner):
         self.model = model
 
     def __call__(self, image: Image.Image) -> str:
+        """Generate a tag-based caption for the input image.
+
+        Args:
+            image (PIL.Image.Image): The input image to caption.
+
+        Returns:
+            str: A comma-separated list of objects and concepts detected in the image.
+        """
         image = self.transform(image).unsqueeze(0).to(self.device)
         res = inference(image, self.model)
         # res[0]: armchair | blanket | lamp | ...

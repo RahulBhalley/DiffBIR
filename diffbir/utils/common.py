@@ -13,6 +13,19 @@ from torch.hub import download_url_to_file, get_dir
 
 
 def get_obj_from_str(string: str, reload: bool = False) -> Any:
+    """Get object from a string path.
+    
+    Args:
+        string: String path to the object, e.g. "module.submodule.class"
+        reload: Whether to reload the module before getting the object
+        
+    Returns:
+        The object specified by the string path
+        
+    Raises:
+        ImportError: If the module or object cannot be imported
+        AttributeError: If the object does not exist in the module
+    """
     module, cls = string.rsplit(".", 1)
     if reload:
         module_imp = importlib.import_module(module)
@@ -21,14 +34,33 @@ def get_obj_from_str(string: str, reload: bool = False) -> Any:
 
 
 def instantiate_from_config(config: Mapping[str, Any]) -> Any:
+    """Instantiate an object from a config dictionary.
+    
+    Args:
+        config: Dictionary containing target class path and parameters.
+               Must have a "target" key with class path string.
+               May have a "params" key with constructor arguments.
+               
+    Returns:
+        Instantiated object
+        
+    Raises:
+        KeyError: If config does not contain "target" key
+    """
     if not "target" in config:
         raise KeyError("Expected key `target` to instantiate.")
     return get_obj_from_str(config["target"])(**config.get("params", dict()))
 
 
 def wavelet_blur(image: Tensor, radius: int):
-    """
-    Apply wavelet blur to the input tensor.
+    """Apply wavelet blur to the input tensor using convolution.
+    
+    Args:
+        image: Input tensor of shape (1, 3, H, W)
+        radius: Dilation radius for the convolution kernel
+        
+    Returns:
+        Blurred tensor of same shape as input
     """
     # input shape: (1, 3, H, W)
     # convolution kernel
@@ -49,9 +81,14 @@ def wavelet_blur(image: Tensor, radius: int):
 
 
 def wavelet_decomposition(image: Tensor, levels=5):
-    """
-    Apply wavelet decomposition to the input tensor.
-    This function only returns the low frequency & the high frequency.
+    """Decompose image into high and low frequency components using wavelets.
+    
+    Args:
+        image: Input tensor to decompose
+        levels: Number of wavelet decomposition levels
+        
+    Returns:
+        Tuple of (high_frequency, low_frequency) components
     """
     high_freq = torch.zeros_like(image)
     for i in range(levels):
@@ -64,8 +101,14 @@ def wavelet_decomposition(image: Tensor, levels=5):
 
 
 def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor):
-    """
-    Apply wavelet decomposition, so that the content will have the same color as the style.
+    """Reconstruct image combining content high frequency with style low frequency.
+    
+    Args:
+        content_feat: Content image features tensor
+        style_feat: Style image features tensor
+        
+    Returns:
+        Reconstructed tensor combining content structure with style color
     """
     # calculate the wavelet decomposition of the content feature
     content_high_freq, content_low_freq = wavelet_decomposition(content_feat)
@@ -77,21 +120,20 @@ def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor):
     return content_high_freq + style_low_freq
 
 
-# https://github.com/XPixelGroup/BasicSR/blob/master/basicsr/utils/download_util.py/
 def load_file_from_url(url, model_dir=None, progress=True, file_name=None):
-    """Load file form http url, will download models if necessary.
-
-    Ref:https://github.com/1adrianb/face-alignment/blob/master/face_alignment/utils.py
+    """Load file from URL, downloading if necessary.
 
     Args:
-        url (str): URL to be downloaded.
-        model_dir (str): The path to save the downloaded model. Should be a full path. If None, use pytorch hub_dir.
-            Default: None.
-        progress (bool): Whether to show the download progress. Default: True.
-        file_name (str): The downloaded file name. If None, use the file name in the url. Default: None.
-
+        url: URL to download from
+        model_dir: Directory to save downloaded file. If None, uses pytorch hub_dir
+        progress: Whether to show download progress bar
+        file_name: Name to save file as. If None, uses name from URL
+        
     Returns:
-        str: The path to the downloaded file.
+        Path to the downloaded file
+        
+    References:
+        https://github.com/1adrianb/face-alignment/blob/master/face_alignment/utils.py
     """
     if model_dir is None:  # use the pytorch hub_dir
         hub_dir = get_dir()
@@ -111,6 +153,14 @@ def load_file_from_url(url, model_dir=None, progress=True, file_name=None):
 
 
 def load_model_from_url(url: str) -> Dict[str, torch.Tensor]:
+    """Load model state dict from URL.
+    
+    Args:
+        url: URL to download model from
+        
+    Returns:
+        Model state dict
+    """
     sd_path = load_file_from_url(url, model_dir="weights")
     sd = torch.load(sd_path, map_location="cpu")
     if "state_dict" in sd:
@@ -123,6 +173,17 @@ def load_model_from_url(url: str) -> Dict[str, torch.Tensor]:
 def sliding_windows(
     h: int, w: int, tile_size: int, tile_stride: int
 ) -> Tuple[int, int, int, int]:
+    """Generate coordinates for sliding windows over an image.
+    
+    Args:
+        h: Image height
+        w: Image width 
+        tile_size: Size of each square tile
+        tile_stride: Stride between tiles
+        
+    Returns:
+        List of tuples (y_start, y_end, x_start, x_end) for each window
+    """
     hi_list = list(range(0, h - tile_size + 1, tile_stride))
     if (h - tile_size) % tile_stride != 0:
         hi_list.append(h - tile_size)
@@ -138,9 +199,19 @@ def sliding_windows(
     return coords
 
 
-# https://github.com/csslc/CCSR/blob/main/model/q_sampler.py#L503
 def gaussian_weights(tile_width: int, tile_height: int) -> np.ndarray:
-    """Generates a gaussian mask of weights for tile contributions"""
+    """Generate Gaussian weights for tile blending.
+    
+    Args:
+        tile_width: Width of tile
+        tile_height: Height of tile
+        
+    Returns:
+        2D numpy array of Gaussian weights
+        
+    References:
+        https://github.com/csslc/CCSR/blob/main/model/q_sampler.py#L503
+    """
     latent_width = tile_width
     latent_height = tile_height
     var = 0.01
@@ -168,7 +239,6 @@ def gaussian_weights(tile_width: int, tile_height: int) -> np.ndarray:
     weights = np.outer(y_probs, x_probs)
     return weights
 
-
 def make_tiled_fn(
     fn: Callable[[torch.Tensor], torch.Tensor],
     size: int,
@@ -179,9 +249,41 @@ def make_tiled_fn(
     weight: Literal["uniform", "gaussian"] = "gaussian",
     dtype: torch.dtype | None = None,
     device: torch.device | None = None,
-    # callback: Callable[[int, int, int, int], None] | None = None,
     progress: bool = True,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Create a tiled version of a tensor processing function.
+
+    This function wraps another function to process large tensors in tiles, which helps
+    reduce memory usage. The tiles can optionally be scaled up or down and blended 
+    together using uniform or gaussian weights.
+
+    Args:
+        fn: Function that processes a single tensor tile
+        size: Size of each tile (both height and width)
+        stride: Stride between tiles
+        scale_type: Whether to scale tiles up or down. Either "up" or "down"
+        scale: Scale factor to apply to tiles
+        channel: Number of channels in output tensor. If None, uses input channels
+        weight: Type of weights for blending tiles. Either "uniform" or "gaussian"
+        dtype: Data type of output tensor. If None, uses input dtype
+        device: Device for output tensor. If None, uses input device
+        progress: Whether to show progress bar during processing
+
+    Returns:
+        A wrapped function that processes tensors in tiles
+
+    Example:
+        >>> def double_tensor(x):
+        ...     return x * 2
+        >>> tiled_fn = make_tiled_fn(double_tensor, size=64, stride=32)
+        >>> output = tiled_fn(large_tensor)
+
+    Notes:
+        - The input tensor must be 4D with shape (batch, channels, height, width)
+        - Tiles are processed with overlap determined by stride
+        - Overlapping regions are blended using the specified weighting
+        - Memory usage scales with tile size rather than full tensor size
+    """
     # Only split the first input of function.
     def tiled_fn(x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         if scale_type == "up":
@@ -236,6 +338,19 @@ TRACE_VRAM = int(os.environ.get("TRACE_VRAM", False))
 
 
 def trace_vram_usage(tag: str) -> Callable:
+    """Decorator to trace VRAM usage before and after function execution.
+
+    Args:
+        tag: String identifier for the trace output
+
+    Returns:
+        Decorator function that wraps the target function
+
+    Example:
+        >>> @trace_vram_usage("model_forward")
+        ... def forward_pass(model, x):
+        ...     return model(x)
+    """
     def wrapper_1(func: Callable) -> Callable:
         if not TRACE_VRAM:
             return func
@@ -259,6 +374,15 @@ def trace_vram_usage(tag: str) -> Callable:
 
 
 class VRAMPeakMonitor:
+    """Context manager to monitor VRAM usage peaks.
+
+    Args:
+        tag: String identifier for the trace output
+
+    Example:
+        >>> with VRAMPeakMonitor("model_inference") as monitor:
+        ...     output = model(input_tensor)
+    """
 
     def __init__(self, tag: str) -> None:
         self.tag = tag
@@ -281,6 +405,21 @@ class VRAMPeakMonitor:
 
 
 def log_txt_as_img(wh, xc):
+    """Convert text captions to image tensors.
+
+    Args:
+        wh: Tuple of (width, height) for output images
+        xc: List of text captions to convert
+
+    Returns:
+        Tensor of shape (batch_size, channels, height, width) containing rendered text
+
+    Notes:
+        - Renders white background with black text
+        - Uses default system font
+        - Automatically wraps text to fit width
+        - Normalizes output to [-1, 1] range
+    """
     # wh a tuple of (width, height)
     # xc a list of captions to plot
     b = len(xc)
@@ -308,6 +447,18 @@ def log_txt_as_img(wh, xc):
 
 
 def to(obj, device):
+    """Recursively move objects to specified device.
+
+    Args:
+        obj: Object to move - can be tensor, dict, tuple, list or other
+        device: Target device to move objects to
+
+    Returns:
+        Object with all contained tensors moved to specified device
+
+    Example:
+        >>> model_output = to(model_output, "cuda:0")
+    """
     if torch.is_tensor(obj):
         return obj.to(device)
     if isinstance(obj, dict):
@@ -319,19 +470,28 @@ def to(obj, device):
     return obj
 
 
-# https://github.com/XPixelGroup/BasicSR/blob/033cd6896d898fdd3dcda32e3102a792efa1b8f4/basicsr/utils/color_util.py#L186
 def rgb2ycbcr_pt(img, y_only=False):
-    """Convert RGB images to YCbCr images (PyTorch version).
+    """Convert RGB images to YCbCr images using PyTorch.
 
-    It implements the ITU-R BT.601 conversion for standard-definition television. See more details in
-    https://en.wikipedia.org/wiki/YCbCr#ITU-R_BT.601_conversion.
+    Implements the ITU-R BT.601 conversion for standard-definition television.
+    See https://en.wikipedia.org/wiki/YCbCr#ITU-R_BT.601_conversion for details.
+
+    The conversion uses the following formulas:
+    Y  =  0.257R + 0.504G + 0.098B + 16
+    Cb = -0.148R - 0.291G + 0.439B + 128
+    Cr =  0.439R - 0.368G - 0.071B + 128
 
     Args:
-        img (Tensor): Images with shape (n, 3, h, w), the range [0, 1], float, RGB format.
-         y_only (bool): Whether to only return Y channel. Default: False.
+        img (torch.Tensor): Input RGB images with shape (n, 3, h, w).
+            Values should be in range [0, 1] and in float format.
+        y_only (bool, optional): If True, returns only Y channel. Defaults to False.
 
     Returns:
-        (Tensor): converted images with the shape (n, 3/1, h, w), the range [0, 1], float.
+        torch.Tensor: YCbCr images with shape (n, 3, h, w) if y_only=False,
+            or (n, 1, h, w) if y_only=True. Values are in range [0, 1].
+
+    Note:
+        The conversion matrix and constants are scaled by 255 since input is [0,1].
     """
     if y_only:
         weight = torch.tensor([[65.481], [128.553], [24.966]]).to(img)
@@ -355,22 +515,37 @@ def rgb2ycbcr_pt(img, y_only=False):
     return out_img
 
 
-# https://github.com/XPixelGroup/BasicSR/blob/033cd6896d898fdd3dcda32e3102a792efa1b8f4/basicsr/metrics/psnr_ssim.py#L52
 def calculate_psnr_pt(img, img2, crop_border, test_y_channel=False):
-    """Calculate PSNR (Peak Signal-to-Noise Ratio) (PyTorch version).
+    """Calculate Peak Signal-to-Noise Ratio (PSNR) between two images using PyTorch.
 
-    Reference: https://en.wikipedia.org/wiki/Peak_signal-to-noise_ratio
+    PSNR is a metric that measures the quality of reconstructed images. It is calculated
+    as the ratio between the maximum possible power of a signal and the power of corrupting
+    noise that affects the fidelity of its representation.
+
+    The formula used is:
+    PSNR = 10 * log10(MAX^2 / MSE)
+    where MAX is the maximum possible pixel value (1.0 in this case) and MSE is the
+    mean squared error between the images.
 
     Args:
-        img (Tensor): Images with range [0, 1], shape (n, 3/1, h, w).
-        img2 (Tensor): Images with range [0, 1], shape (n, 3/1, h, w).
-        crop_border (int): Cropped pixels in each edge of an image. These pixels are not involved in the calculation.
-        test_y_channel (bool): Test on Y channel of YCbCr. Default: False.
+        img (torch.Tensor): First image with shape (n, 3/1, h, w).
+            Values should be in range [0, 1].
+        img2 (torch.Tensor): Second image with shape (n, 3/1, h, w).
+            Values should be in range [0, 1].
+        crop_border (int): Number of pixels to crop from each border of the images.
+            These pixels are excluded from the PSNR calculation.
+        test_y_channel (bool, optional): If True, converts images to YCbCr and
+            calculates PSNR on Y channel only. Defaults to False.
 
     Returns:
-        float: PSNR result.
-    """
+        torch.Tensor: PSNR values for each image in the batch.
 
+    Raises:
+        AssertionError: If input images have different shapes.
+
+    Note:
+        A small epsilon (1e-8) is added to the MSE to avoid log(0) errors.
+    """
     assert (
         img.shape == img2.shape
     ), f"Image shapes are different: {img.shape}, {img2.shape}."
