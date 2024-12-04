@@ -10,25 +10,34 @@ from ..model.cldm import ControlLDM
 from ..utils.common import make_tiled_fn, trace_vram_usage
 
 
-# https://github.com/openai/guided-diffusion/blob/main/guided_diffusion/respace.py
-def space_timesteps(num_timesteps, section_counts):
-    """
-    Create a list of timesteps to use from an original diffusion process,
-    given the number of timesteps we want to take from equally-sized portions
-    of the original process.
-    For example, if there's 300 timesteps and the section counts are [10,15,20]
-    then the first 100 timesteps are strided to be 10 timesteps, the second 100
-    are strided to be 15 timesteps, and the final 100 are strided to be 20.
-    If the stride is a string starting with "ddim", then the fixed striding
-    from the DDIM paper is used, and only one section is allowed.
-    :param num_timesteps: the number of diffusion steps in the original
-                          process to divide up.
-    :param section_counts: either a list of numbers, or a string containing
-                           comma-separated numbers, indicating the step count
-                           per section. As a special case, use "ddimN" where N
-                           is a number of steps to use the striding from the
-                           DDIM paper.
-    :return: a set of diffusion steps from the original process to use.
+def space_timesteps(num_timesteps: int, section_counts: Union[str, List[int]]) -> Set[int]:
+    """Create a list of timesteps to use from an original diffusion process.
+
+    Takes the original number of timesteps and divides them into sections based on the provided
+    section counts. Each section will have an equal portion of the original timesteps, strided
+    according to the count for that section.
+
+    Args:
+        num_timesteps: The total number of timesteps in the original diffusion process.
+        section_counts: Either a string containing comma-separated numbers indicating step counts
+            per section, or a list of integers. As a special case, can be "ddimN" where N is the
+            desired number of steps to use DDIM-style striding.
+
+    Returns:
+        A set of integers representing the selected timesteps from the original process.
+
+    Examples:
+        >>> space_timesteps(300, [10,15,20])
+        # First 100 steps strided to 10 steps
+        # Second 100 steps strided to 15 steps 
+        # Final 100 steps strided to 20 steps
+
+        >>> space_timesteps(1000, "ddim100")
+        # 1000 steps strided to exactly 100 steps using DDIM spacing
+
+    Raises:
+        ValueError: If a section cannot be divided into the requested number of steps,
+            or if DDIM striding cannot achieve the exact requested step count.
     """
     if isinstance(section_counts, str):
         if section_counts.startswith("ddim"):
@@ -65,16 +74,45 @@ def space_timesteps(num_timesteps, section_counts):
 
 
 class SpacedSampler(Sampler):
+    """A sampler that uses spaced timesteps for the diffusion process.
+
+    This sampler implements a diffusion process using non-uniformly spaced timesteps.
+    It supports both epsilon and v-parameterizations of the diffusion model.
+
+    Args:
+        betas: Array of beta schedule values for the diffusion process.
+        parameterization: Either "eps" or "v" indicating the model's parameterization.
+        rescale_cfg: Whether to rescale classifier-free guidance.
+
+    Attributes:
+        timesteps: Array of selected timesteps for the diffusion process.
+        sqrt_alphas_cumprod: Precomputed values for sampling calculations.
+        sqrt_one_minus_alphas_cumprod: Precomputed values for sampling calculations.
+        sqrt_recip_alphas_cumprod: Precomputed values for sampling calculations.
+        sqrt_recipm1_alphas_cumprod: Precomputed values for sampling calculations.
+        posterior_variance: Precomputed posterior variance values.
+        posterior_log_variance_clipped: Clipped log of posterior variance.
+        posterior_mean_coef1: First coefficient for posterior mean calculation.
+        posterior_mean_coef2: Second coefficient for posterior mean calculation.
+    """
 
     def __init__(
         self,
         betas: np.ndarray,
         parameterization: Literal["eps", "v"],
         rescale_cfg: bool,
-    ) -> "SpacedSampler":
+    ) -> None:
         super().__init__(betas, parameterization, rescale_cfg)
 
     def make_schedule(self, num_steps: int) -> None:
+        """Creates a diffusion schedule with the specified number of steps.
+
+        Computes and stores various coefficients needed for the diffusion process
+        based on the requested number of steps.
+
+        Args:
+            num_steps: Number of diffusion steps to use.
+        """
         used_timesteps = space_timesteps(self.num_timesteps, str(num_steps))
         betas = []
         last_alpha_cumprod = 1.0
@@ -84,7 +122,7 @@ class SpacedSampler(Sampler):
                 last_alpha_cumprod = alpha_cumprod
         self.timesteps = np.array(
             sorted(list(used_timesteps)), dtype=np.int32
-        )  # e.g. [0, 10, 20, ...]
+        )
 
         betas = np.array(betas, dtype=np.float64)
         alphas = 1.0 - betas
@@ -117,7 +155,19 @@ class SpacedSampler(Sampler):
 
     def q_posterior_mean_variance(
         self, x_start: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor
-    ) -> Tuple[torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Computes the mean and variance of the diffusion posterior.
+
+        Args:
+            x_start: The initial sample.
+            x_t: The noisy sample at timestep t.
+            t: The timestep.
+
+        Returns:
+            A tuple containing:
+                - The posterior mean
+                - The posterior variance
+        """
         mean = (
             extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
             + extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
@@ -128,6 +178,16 @@ class SpacedSampler(Sampler):
     def _predict_xstart_from_eps(
         self, x_t: torch.Tensor, t: torch.Tensor, eps: torch.Tensor
     ) -> torch.Tensor:
+        """Predicts x_0 from the noise eps using the epsilon parameterization.
+
+        Args:
+            x_t: The noisy sample at timestep t.
+            t: The timestep.
+            eps: The predicted noise.
+
+        Returns:
+            The predicted x_0.
+        """
         return (
             extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
             - extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
@@ -136,6 +196,16 @@ class SpacedSampler(Sampler):
     def _predict_xstart_from_v(
         self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
+        """Predicts x_0 from v using the v-parameterization.
+
+        Args:
+            x_t: The noisy sample at timestep t.
+            t: The timestep.
+            v: The predicted v value.
+
+        Returns:
+            The predicted x_0.
+        """
         return (
             extract_into_tensor(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t
             - extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
@@ -150,6 +220,19 @@ class SpacedSampler(Sampler):
         uncond: Optional[Dict[str, torch.Tensor]],
         cfg_scale: float,
     ) -> torch.Tensor:
+        """Applies the model with classifier-free guidance.
+
+        Args:
+            model: The diffusion model.
+            x: The input tensor.
+            model_t: The timestep tensor for the model.
+            cond: The conditional inputs.
+            uncond: The unconditional inputs (optional).
+            cfg_scale: The classifier-free guidance scale.
+
+        Returns:
+            The model output with classifier-free guidance applied.
+        """
         if uncond is None or cfg_scale == 1.0:
             model_output = model(x, model_t, cond)
         else:
@@ -169,15 +252,26 @@ class SpacedSampler(Sampler):
         uncond: Optional[Dict[str, torch.Tensor]],
         cfg_scale: float,
     ) -> torch.Tensor:
-        # predict x_0
+        """Samples from the model at a given timestep.
+
+        Args:
+            model: The diffusion model.
+            x: The current sample.
+            model_t: The timestep tensor for the model.
+            t: The current timestep.
+            cond: The conditional inputs.
+            uncond: The unconditional inputs (optional).
+            cfg_scale: The classifier-free guidance scale.
+
+        Returns:
+            The next sample in the diffusion process.
+        """
         model_output = self.apply_model(model, x, model_t, cond, uncond, cfg_scale)
         if self.parameterization == "eps":
             pred_x0 = self._predict_xstart_from_eps(x, t, model_output)
         else:
             pred_x0 = self._predict_xstart_from_v(x, t, model_output)
-        # calculate mean and variance of next state
         mean, variance = self.q_posterior_mean_variance(pred_x0, x, t)
-        # sample next state
         noise = torch.randn_like(x)
         nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         x_prev = mean + nonzero_mask * torch.sqrt(variance) * noise
@@ -196,9 +290,28 @@ class SpacedSampler(Sampler):
         tiled: bool = False,
         tile_size: int = -1,
         tile_stride: int = -1,
-        x_T: torch.Tensor | None = None,
+        x_T: Optional[torch.Tensor] = None,
         progress: bool = True,
     ) -> torch.Tensor:
+        """Generates samples using the diffusion model.
+
+        Args:
+            model: The diffusion model.
+            device: The device to run on.
+            steps: Number of diffusion steps.
+            x_size: Size of the output tensor.
+            cond: The conditional inputs.
+            uncond: The unconditional inputs.
+            cfg_scale: The classifier-free guidance scale.
+            tiled: Whether to use tiled generation.
+            tile_size: Size of tiles if using tiled generation.
+            tile_stride: Stride between tiles if using tiled generation.
+            x_T: Optional starting noise tensor.
+            progress: Whether to show progress bar.
+
+        Returns:
+            The generated sample.
+        """
         self.make_schedule(steps)
         self.to(device)
         if tiled:

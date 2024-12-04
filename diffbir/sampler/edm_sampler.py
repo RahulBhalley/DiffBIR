@@ -1,3 +1,10 @@
+"""
+Implementation of EDM (Elucidated Diffusion Models) sampler.
+
+This module provides the EDMSampler class which implements various sampling algorithms
+for diffusion models based on the EDM framework.
+"""
+
 from typing import Literal, Dict, Optional, Callable
 import numpy as np
 import torch
@@ -24,6 +31,16 @@ from ..utils.common import make_tiled_fn, trace_vram_usage
 
 
 class EDMSampler(Sampler):
+    """
+    EDM sampler implementing various sampling algorithms for diffusion models.
+
+    This class provides an implementation of different sampling methods like Euler,
+    Heun, DPM-Solver, etc. for generating samples from diffusion models.
+
+    Attributes:
+        TYPE_TO_SOLVER (dict): Mapping of solver types to their implementation functions
+            and required hyperparameters.
+    """
 
     TYPE_TO_SOLVER = {
         "euler": (sample_euler, ("s_churn", "s_tmin", "s_tmax", "s_noise")),
@@ -53,6 +70,24 @@ class EDMSampler(Sampler):
         eta: float,
         order: int,
     ) -> "EDMSampler":
+        """
+        Initialize the EDM sampler.
+
+        Args:
+            betas (np.ndarray): Noise schedule.
+            parameterization (Literal["eps", "v"]): Model output parameterization.
+            rescale_cfg (bool): Whether to rescale classifier-free guidance.
+            solver_type (str): Type of solver to use.
+            s_churn (float): Churn parameter for applicable solvers.
+            s_tmin (float): Minimum timestep for churn.
+            s_tmax (float): Maximum timestep for churn.
+            s_noise (float): Noise level for sampling.
+            eta (float): Noise parameter for ancestral sampling.
+            order (int): Order for LMS solver.
+
+        Returns:
+            EDMSampler: Initialized sampler instance.
+        """
         super().__init__(betas, parameterization, rescale_cfg)
         solver_type = solver_type[len("edm_") :]
         solver_fn, solver_hparams = self.TYPE_TO_SOLVER[solver_type]
@@ -81,15 +116,18 @@ class EDMSampler(Sampler):
         self.solver_fn = wrapped_solver_fn
 
     def make_schedule(self, steps: int) -> None:
+        """
+        Create a sampling schedule.
+
+        Args:
+            steps (int): Number of sampling steps.
+        """
         timesteps = np.linspace(
             len(self.training_alphas_cumprod) - 1, 0, steps, endpoint=False
         ).astype(int)
         alphas_cumprod = self.training_alphas_cumprod[timesteps].copy()
-        # clip alphas cumprod to avoid divide-by-zero
-        # alphas_cumprod = np.clip(alphas_cumprod, a_min=1e-6)
         alphas_cumprod[0] = 1e-8
         sigmas = ((1 - alphas_cumprod) / alphas_cumprod) ** 0.5
-        # print(sigmas)
         sigmas = np.append(sigmas, 0)
         timesteps = np.append(timesteps, 0)
         self.register("sigmas", sigmas)
@@ -102,6 +140,18 @@ class EDMSampler(Sampler):
         uncond: Optional[Dict[str, torch.Tensor]],
         cfg_scale: float,
     ) -> Callable:
+        """
+        Convert the model to a denoising function.
+
+        Args:
+            model (ControlLDM): The control-guided diffusion model.
+            cond (Dict[str, torch.Tensor]): Conditioning inputs.
+            uncond (Optional[Dict[str, torch.Tensor]]): Unconditional inputs for CFG.
+            cfg_scale (float): Classifier-free guidance scale.
+
+        Returns:
+            Callable: Denoising function that takes noisy input and noise level.
+        """
         def denoiser(x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
             if self.parameterization == "eps":
                 c_skip = torch.ones_like(sigma)
@@ -113,12 +163,9 @@ class EDMSampler(Sampler):
                 c_out = -sigma / (sigma**2 + 1.0) ** 0.5
                 c_in = 1.0 / (sigma**2 + 1.0) ** 0.5
                 c_noise = sigma.clone()
-            # convert c_noise to t
             c_noise = self.timesteps[
                 (c_noise - self.sigmas[:, None]).abs().argmin(dim=0).view(sigma.shape)
             ]
-            # compute current cfg scale
-            # all samples in a batch share the same timestep
             cur_cfg_scale = self.get_cfg_scale(cfg_scale, c_noise[0].item())
 
             c_in, c_out, c_skip = map(
@@ -152,6 +199,26 @@ class EDMSampler(Sampler):
         x_T: torch.Tensor | None = None,
         progress: bool = True,
     ) -> torch.Tensor:
+        """
+        Generate samples using the EDM sampler.
+
+        Args:
+            model (ControlLDM): The control-guided diffusion model.
+            device (str): Device to run sampling on.
+            steps (int): Number of sampling steps.
+            x_size (torch.Tuple[int]): Size of the output tensor.
+            cond (Dict[str, torch.Tensor]): Conditioning inputs.
+            uncond (Dict[str, torch.Tensor]): Unconditional inputs for CFG.
+            cfg_scale (float): Classifier-free guidance scale.
+            tiled (bool, optional): Whether to use tiled sampling. Defaults to False.
+            tile_size (int, optional): Size of tiles for tiled sampling. Defaults to -1.
+            tile_stride (int, optional): Stride between tiles. Defaults to -1.
+            x_T (torch.Tensor | None, optional): Initial noise. Defaults to None.
+            progress (bool, optional): Whether to show progress bar. Defaults to True.
+
+        Returns:
+            torch.Tensor: Generated samples.
+        """
         self.make_schedule(steps)
         self.to(device)
         if tiled:

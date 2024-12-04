@@ -15,6 +15,25 @@ from ..utils.common import make_tiled_fn, trace_vram_usage
 
 
 class DPMSolverSampler(Sampler):
+    """DPM-Solver sampler implementation.
+
+    This sampler implements the DPM-Solver algorithm for diffusion model sampling.
+    It supports both DPM-Solver and DPM-Solver++ variants with single-step and multi-step methods.
+
+    Args:
+        betas (np.ndarray): The beta schedule for the diffusion process.
+        parameterization (Literal["eps", "v"]): The model's output parameterization.
+            Use "eps" for predicting noise, "v" for predicting v-prediction.
+        rescale_cfg (bool): Whether to rescale classifier-free guidance.
+        model_spec (str): Specification string for the solver configuration.
+            Format: "<solver_type>_<method><order>"
+            Examples:
+                - "dpm_s2": DPM-Solver, single-step, order 2
+                - "dpm++_m3": DPM-Solver++, multi-step, order 3
+
+    Raises:
+        ValueError: If parameterization is not "eps" or "v".
+    """
 
     def __init__(
         self,
@@ -54,6 +73,26 @@ class DPMSolverSampler(Sampler):
         x_T: torch.Tensor | None = None,
         progress: bool = True,
     ) -> torch.Tensor:
+        """Sample from the diffusion model using DPM-Solver.
+
+        Args:
+            model (ControlLDM): The controlled latent diffusion model.
+            device (str): Device to run sampling on ('cuda' or 'cpu').
+            steps (int): Number of sampling steps.
+            x_size (Tuple[int]): Size of the output tensor.
+            cond (Dict[str, torch.Tensor]): Conditioning inputs.
+            uncond (Dict[str, torch.Tensor]): Unconditional inputs for CFG.
+            cfg_scale (float): Classifier-free guidance scale.
+            tiled (bool, optional): Whether to use tiled sampling. Defaults to False.
+            tile_size (int, optional): Size of tiles if tiled sampling. Defaults to -1.
+            tile_stride (int, optional): Stride between tiles. Defaults to -1.
+            x_T (torch.Tensor | None, optional): Initial noise. If None, random noise is used.
+                Defaults to None.
+            progress (bool, optional): Whether to show progress. Defaults to True.
+
+        Returns:
+            torch.Tensor: The sampled output.
+        """
         if tiled:
             forward = model.forward
             model.forward = make_tiled_fn(

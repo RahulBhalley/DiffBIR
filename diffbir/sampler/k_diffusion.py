@@ -1,3 +1,24 @@
+"""
+K-diffusion sampling algorithms and utilities.
+
+This module implements various sampling algorithms and helper functions for K-diffusion,
+following Karras et al. (2022).
+
+Functions:
+    append_dims: Append dimensions to a tensor until it reaches target dimensions.
+    append_zero: Append a zero element to the end of a tensor.
+    get_sigmas_karras: Construct noise schedule from Karras et al. (2022).
+    get_sigmas_exponential: Construct exponential noise schedule.
+    get_sigmas_polyexponential: Construct polynomial-exponential noise schedule.
+    get_sigmas_vp: Construct continuous VP noise schedule.
+    to_d: Convert denoiser output to Karras ODE derivative.
+    get_ancestral_step: Calculate noise levels for ancestral sampling step.
+    default_noise_sampler: Default noise sampling function.
+    sample_euler: Euler method sampler.
+    sample_euler_ancestral: Ancestral sampling with Euler steps.
+    sample_heun: Heun method sampler.
+"""
+
 import math
 
 from scipy import integrate
@@ -8,7 +29,18 @@ from tqdm.auto import trange, tqdm
 
 
 def append_dims(x, target_dims):
-    """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
+    """Append dimensions to the end of a tensor until it has target_dims dimensions.
+    
+    Args:
+        x (torch.Tensor): Input tensor to append dimensions to
+        target_dims (int): Desired number of dimensions
+        
+    Returns:
+        torch.Tensor: Tensor with dimensions appended up to target_dims
+        
+    Raises:
+        ValueError: If target_dims is less than input tensor's dimensions
+    """
     dims_to_append = target_dims - x.ndim
     if dims_to_append < 0:
         raise ValueError(f'input has {x.ndim} dims but target_dims is {target_dims}, which is less')
@@ -16,11 +48,30 @@ def append_dims(x, target_dims):
 
 
 def append_zero(x):
+    """Append a zero element to the end of a tensor.
+    
+    Args:
+        x (torch.Tensor): Input tensor
+        
+    Returns:
+        torch.Tensor: Tensor with zero appended
+    """
     return torch.cat([x, x.new_zeros([1])])
 
 
 def get_sigmas_karras(n, sigma_min, sigma_max, rho=7., device='cpu'):
-    """Constructs the noise schedule of Karras et al. (2022)."""
+    """Construct the noise schedule of Karras et al. (2022).
+    
+    Args:
+        n (int): Number of noise levels
+        sigma_min (float): Minimum noise level
+        sigma_max (float): Maximum noise level
+        rho (float, optional): Schedule parameter. Defaults to 7.0
+        device (str, optional): Device to place tensors on. Defaults to 'cpu'
+        
+    Returns:
+        torch.Tensor: Tensor of noise levels with shape (n+1,)
+    """
     ramp = torch.linspace(0, 1, n)
     min_inv_rho = sigma_min ** (1 / rho)
     max_inv_rho = sigma_max ** (1 / rho)
@@ -29,33 +80,82 @@ def get_sigmas_karras(n, sigma_min, sigma_max, rho=7., device='cpu'):
 
 
 def get_sigmas_exponential(n, sigma_min, sigma_max, device='cpu'):
-    """Constructs an exponential noise schedule."""
+    """Construct an exponential noise schedule.
+    
+    Args:
+        n (int): Number of noise levels
+        sigma_min (float): Minimum noise level
+        sigma_max (float): Maximum noise level
+        device (str, optional): Device to place tensors on. Defaults to 'cpu'
+        
+    Returns:
+        torch.Tensor: Tensor of noise levels with shape (n+1,)
+    """
     sigmas = torch.linspace(math.log(sigma_max), math.log(sigma_min), n, device=device).exp()
     return append_zero(sigmas)
 
 
 def get_sigmas_polyexponential(n, sigma_min, sigma_max, rho=1., device='cpu'):
-    """Constructs an polynomial in log sigma noise schedule."""
+    """Construct a polynomial in log sigma noise schedule.
+    
+    Args:
+        n (int): Number of noise levels
+        sigma_min (float): Minimum noise level
+        sigma_max (float): Maximum noise level
+        rho (float, optional): Schedule parameter. Defaults to 1.0
+        device (str, optional): Device to place tensors on. Defaults to 'cpu'
+        
+    Returns:
+        torch.Tensor: Tensor of noise levels with shape (n+1,)
+    """
     ramp = torch.linspace(1, 0, n, device=device) ** rho
     sigmas = torch.exp(ramp * (math.log(sigma_max) - math.log(sigma_min)) + math.log(sigma_min))
     return append_zero(sigmas)
 
 
 def get_sigmas_vp(n, beta_d=19.9, beta_min=0.1, eps_s=1e-3, device='cpu'):
-    """Constructs a continuous VP noise schedule."""
+    """Construct a continuous VP noise schedule.
+    
+    Args:
+        n (int): Number of noise levels
+        beta_d (float, optional): Maximum noise level parameter. Defaults to 19.9
+        beta_min (float, optional): Minimum noise level parameter. Defaults to 0.1
+        eps_s (float, optional): Small constant. Defaults to 1e-3
+        device (str, optional): Device to place tensors on. Defaults to 'cpu'
+        
+    Returns:
+        torch.Tensor: Tensor of noise levels with shape (n+1,)
+    """
     t = torch.linspace(1, eps_s, n, device=device)
     sigmas = torch.sqrt(torch.exp(beta_d * t ** 2 / 2 + beta_min * t) - 1)
     return append_zero(sigmas)
 
 
 def to_d(x, sigma, denoised):
-    """Converts a denoiser output to a Karras ODE derivative."""
+    """Convert a denoiser output to a Karras ODE derivative.
+    
+    Args:
+        x (torch.Tensor): Input tensor
+        sigma (torch.Tensor): Noise level
+        denoised (torch.Tensor): Denoised output
+        
+    Returns:
+        torch.Tensor: ODE derivative
+    """
     return (x - denoised) / append_dims(sigma, x.ndim)
 
 
 def get_ancestral_step(sigma_from, sigma_to, eta=1.):
-    """Calculates the noise level (sigma_down) to step down to and the amount
-    of noise to add (sigma_up) when doing an ancestral sampling step."""
+    """Calculate the noise levels for an ancestral sampling step.
+    
+    Args:
+        sigma_from (float): Starting noise level
+        sigma_to (float): Target noise level
+        eta (float, optional): Ancestral sampling parameter. Defaults to 1.0
+        
+    Returns:
+        tuple: (sigma_down, sigma_up) - noise levels for stepping down and adding noise
+    """
     if not eta:
         return sigma_to, 0.
     sigma_up = min(sigma_to, eta * (sigma_to ** 2 * (sigma_from ** 2 - sigma_to ** 2) / sigma_from ** 2) ** 0.5)
@@ -64,11 +164,27 @@ def get_ancestral_step(sigma_from, sigma_to, eta=1.):
 
 
 def default_noise_sampler(x):
+    """Create a default noise sampling function.
+    
+    Args:
+        x (torch.Tensor): Template tensor for shape/device/dtype
+        
+    Returns:
+        callable: Noise sampling function
+    """
     return lambda sigma, sigma_next: torch.randn_like(x)
 
 
 class BatchedBrownianTree:
-    """A wrapper around torchsde.BrownianTree that enables batches of entropy."""
+    """A wrapper around torchsde.BrownianTree that enables batches of entropy.
+    
+    Args:
+        x (torch.Tensor): Template tensor for shape/device/dtype
+        t0 (float): Start time
+        t1 (float): End time
+        seed (int or None, optional): Random seed. Defaults to None
+        **kwargs: Additional arguments passed to BrownianTree
+    """
 
     def __init__(self, x, t0, t1, seed=None, **kwargs):
         t0, t1, self.sign = self.sort(t0, t1)
@@ -86,9 +202,11 @@ class BatchedBrownianTree:
 
     @staticmethod
     def sort(a, b):
+        """Sort two values and return sort direction."""
         return (a, b, 1) if a < b else (b, a, -1)
 
     def __call__(self, t0, t1):
+        """Sample noise for the interval [t0, t1]."""
         t0, t1, sign = self.sort(t0, t1)
         w = torch.stack([tree(t0, t1) for tree in self.trees]) * (self.sign * sign)
         return w if self.batched else w[0]
@@ -98,15 +216,11 @@ class BrownianTreeNoiseSampler:
     """A noise sampler backed by a torchsde.BrownianTree.
 
     Args:
-        x (Tensor): The tensor whose shape, device and dtype to use to generate
-            random samples.
-        sigma_min (float): The low end of the valid interval.
-        sigma_max (float): The high end of the valid interval.
-        seed (int or List[int]): The random seed. If a list of seeds is
-            supplied instead of a single integer, then the noise sampler will
-            use one BrownianTree per batch item, each with its own seed.
-        transform (callable): A function that maps sigma to the sampler's
-            internal timestep.
+        x (torch.Tensor): Template tensor for shape/device/dtype
+        sigma_min (float): Minimum noise level
+        sigma_max (float): Maximum noise level
+        seed (int or List[int], optional): Random seed(s). Defaults to None
+        transform (callable, optional): Maps sigma to internal timestep. Defaults to identity
     """
 
     def __init__(self, x, sigma_min, sigma_max, seed=None, transform=lambda x: x):
@@ -115,13 +229,30 @@ class BrownianTreeNoiseSampler:
         self.tree = BatchedBrownianTree(x, t0, t1, seed)
 
     def __call__(self, sigma, sigma_next):
+        """Sample noise for transitioning from sigma to sigma_next."""
         t0, t1 = self.transform(torch.as_tensor(sigma)), self.transform(torch.as_tensor(sigma_next))
         return self.tree(t0, t1) / (t1 - t0).abs().sqrt()
 
 
 @torch.no_grad()
 def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1.):
-    """Implements Algorithm 2 (Euler steps) from Karras et al. (2022)."""
+    """Implements Algorithm 2 (Euler steps) from Karras et al. (2022).
+    
+    Args:
+        model (callable): Model function
+        x (torch.Tensor): Input tensor
+        sigmas (torch.Tensor): Noise schedule
+        extra_args (dict, optional): Extra arguments for model. Defaults to None
+        callback (callable, optional): Callback function. Defaults to None
+        disable (bool, optional): Disable progress bar. Defaults to None
+        s_churn (float, optional): Stochasticity parameter. Defaults to 0.0
+        s_tmin (float, optional): Minimum sigma for stochasticity. Defaults to 0.0
+        s_tmax (float, optional): Maximum sigma for stochasticity. Defaults to inf
+        s_noise (float, optional): Noise scale. Defaults to 1.0
+        
+    Returns:
+        torch.Tensor: Sampled tensor
+    """
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
     for i in trange(len(sigmas) - 1, disable=disable):
@@ -142,7 +273,22 @@ def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None,
 
 @torch.no_grad()
 def sample_euler_ancestral(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None):
-    """Ancestral sampling with Euler method steps."""
+    """Ancestral sampling with Euler method steps.
+    
+    Args:
+        model (callable): Model function
+        x (torch.Tensor): Input tensor
+        sigmas (torch.Tensor): Noise schedule
+        extra_args (dict, optional): Extra arguments for model. Defaults to None
+        callback (callable, optional): Callback function. Defaults to None
+        disable (bool, optional): Disable progress bar. Defaults to None
+        eta (float, optional): Ancestral sampling parameter. Defaults to 1.0
+        s_noise (float, optional): Noise scale. Defaults to 1.0
+        noise_sampler (callable, optional): Noise sampling function. Defaults to None
+        
+    Returns:
+        torch.Tensor: Sampled tensor
+    """
     extra_args = {} if extra_args is None else extra_args
     noise_sampler = default_noise_sampler(x) if noise_sampler is None else noise_sampler
     s_in = x.new_ones([x.shape[0]])
@@ -162,7 +308,23 @@ def sample_euler_ancestral(model, x, sigmas, extra_args=None, callback=None, dis
 
 @torch.no_grad()
 def sample_heun(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1.):
-    """Implements Algorithm 2 (Heun steps) from Karras et al. (2022)."""
+    """Implements Algorithm 2 (Heun steps) from Karras et al. (2022).
+    
+    Args:
+        model (callable): Model function
+        x (torch.Tensor): Input tensor
+        sigmas (torch.Tensor): Noise schedule
+        extra_args (dict, optional): Extra arguments for model. Defaults to None
+        callback (callable, optional): Callback function. Defaults to None
+        disable (bool, optional): Disable progress bar. Defaults to None
+        s_churn (float, optional): Stochasticity parameter. Defaults to 0.0
+        s_tmin (float, optional): Minimum sigma for stochasticity. Defaults to 0.0
+        s_tmax (float, optional): Maximum sigma for stochasticity. Defaults to inf
+        s_noise (float, optional): Noise scale. Defaults to 1.0
+        
+    Returns:
+        torch.Tensor: Sampled tensor
+    """
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
     for i in trange(len(sigmas) - 1, disable=disable):
@@ -191,7 +353,31 @@ def sample_heun(model, x, sigmas, extra_args=None, callback=None, disable=None, 
 
 @torch.no_grad()
 def sample_dpm_2(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1.):
-    """A sampler inspired by DPM-Solver-2 and Algorithm 2 from Karras et al. (2022)."""
+    """A sampler inspired by DPM-Solver-2 and Algorithm 2 from Karras et al. (2022).
+
+    This sampler combines ideas from DPM-Solver-2 and Karras et al.'s Algorithm 2 to provide
+    high-quality sampling with second-order accuracy.
+
+    Args:
+        model (callable): Model function that takes (x, sigma) and returns predicted noise/score.
+        x (torch.Tensor): Input tensor containing the initial noise.
+        sigmas (torch.Tensor): Sequence of noise levels defining the diffusion schedule.
+        extra_args (dict, optional): Extra arguments to pass to model. Defaults to None.
+        callback (callable, optional): Function called after each step with diagnostic data. Defaults to None.
+        disable (bool, optional): Disable progress bar. Defaults to None.
+        s_churn (float, optional): Parameter controlling amount of stochasticity. Defaults to 0.0.
+        s_tmin (float, optional): Minimum sigma where stochasticity is applied. Defaults to 0.0.
+        s_tmax (float, optional): Maximum sigma where stochasticity is applied. Defaults to infinity.
+        s_noise (float, optional): Scaling factor for noise. Defaults to 1.0.
+
+    Returns:
+        torch.Tensor: The denoised sample.
+
+    Notes:
+        The sampler uses Euler steps at sigma=0 and DPM-Solver-2 steps otherwise.
+        Stochasticity is controlled by s_churn parameter and only applied when sigma is
+        between s_tmin and s_tmax.
+    """
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
     for i in trange(len(sigmas) - 1, disable=disable):
@@ -222,7 +408,29 @@ def sample_dpm_2(model, x, sigmas, extra_args=None, callback=None, disable=None,
 
 @torch.no_grad()
 def sample_dpm_2_ancestral(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None):
-    """Ancestral sampling with DPM-Solver second-order steps."""
+    """Ancestral sampling with DPM-Solver second-order steps.
+
+    This sampler combines ancestral sampling with DPM-Solver-2 steps for improved sample quality.
+
+    Args:
+        model (callable): Model function that takes (x, sigma) and returns predicted noise/score.
+        x (torch.Tensor): Input tensor containing the initial noise.
+        sigmas (torch.Tensor): Sequence of noise levels defining the diffusion schedule.
+        extra_args (dict, optional): Extra arguments to pass to model. Defaults to None.
+        callback (callable, optional): Function called after each step with diagnostic data. Defaults to None.
+        disable (bool, optional): Disable progress bar. Defaults to None.
+        eta (float, optional): Parameter controlling the stochasticity. Defaults to 1.0.
+        s_noise (float, optional): Scaling factor for noise. Defaults to 1.0.
+        noise_sampler (callable, optional): Custom noise sampling function. Defaults to None.
+
+    Returns:
+        torch.Tensor: The denoised sample.
+
+    Notes:
+        - Uses DPM-Solver-2 steps for deterministic updates
+        - Adds ancestral sampling noise after each step
+        - Falls back to Euler method when sigma reaches 0
+    """
     extra_args = {} if extra_args is None else extra_args
     noise_sampler = default_noise_sampler(x) if noise_sampler is None else noise_sampler
     s_in = x.new_ones([x.shape[0]])
@@ -250,6 +458,23 @@ def sample_dpm_2_ancestral(model, x, sigmas, extra_args=None, callback=None, dis
 
 
 def linear_multistep_coeff(order, t, i, j):
+    """Compute linear multistep coefficients.
+
+    Args:
+        order (int): Order of the multistep method.
+        t (ndarray): Time points.
+        i (int): Current step index.
+        j (int): Index for coefficient calculation.
+
+    Returns:
+        float: Coefficient for the linear multistep method.
+
+    Raises:
+        ValueError: If requested order is too high for the current step.
+
+    Notes:
+        Computes coefficients for linear multistep methods using Lagrange polynomial interpolation.
+    """
     if order - 1 > i:
         raise ValueError(f'Order {order} too high for step {i}')
     def fn(tau):
@@ -264,6 +489,27 @@ def linear_multistep_coeff(order, t, i, j):
 
 @torch.no_grad()
 def sample_lms(model, x, sigmas, extra_args=None, callback=None, disable=None, order=4):
+    """Linear multistep sampling.
+
+    Implements sampling using linear multistep methods of arbitrary order.
+
+    Args:
+        model (callable): Model function that takes (x, sigma) and returns predicted noise/score.
+        x (torch.Tensor): Input tensor containing the initial noise.
+        sigmas (torch.Tensor): Sequence of noise levels defining the diffusion schedule.
+        extra_args (dict, optional): Extra arguments to pass to model. Defaults to None.
+        callback (callable, optional): Function called after each step with diagnostic data. Defaults to None.
+        disable (bool, optional): Disable progress bar. Defaults to None.
+        order (int, optional): Order of the linear multistep method. Defaults to 4.
+
+    Returns:
+        torch.Tensor: The denoised sample.
+
+    Notes:
+        - Uses linear multistep methods for high-order accuracy
+        - Automatically adjusts order based on available steps
+        - Computes coefficients using Lagrange polynomial interpolation
+    """
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
     sigmas_cpu = sigmas.detach().cpu().numpy()
@@ -282,32 +528,26 @@ def sample_lms(model, x, sigmas, extra_args=None, callback=None, disable=None, o
     return x
 
 
-# @torch.no_grad()
-# def log_likelihood(model, x, sigma_min, sigma_max, extra_args=None, atol=1e-4, rtol=1e-4):
-#     extra_args = {} if extra_args is None else extra_args
-#     s_in = x.new_ones([x.shape[0]])
-#     v = torch.randint_like(x, 2) * 2 - 1
-#     fevals = 0
-#     def ode_fn(sigma, x):
-#         nonlocal fevals
-#         with torch.enable_grad():
-#             x = x[0].detach().requires_grad_()
-#             denoised = model(x, sigma * s_in, **extra_args)
-#             d = to_d(x, sigma, denoised)
-#             fevals += 1
-#             grad = torch.autograd.grad((d * v).sum(), x)[0]
-#             d_ll = (v * grad).flatten(1).sum(1)
-#         return d.detach(), d_ll
-#     x_min = x, x.new_zeros([x.shape[0]])
-#     t = x.new_tensor([sigma_min, sigma_max])
-#     sol = odeint(ode_fn, x_min, t, atol=atol, rtol=rtol, method='dopri5')
-#     latent, delta_ll = sol[0][-1], sol[1][-1]
-#     ll_prior = torch.distributions.Normal(0, sigma_max).log_prob(latent).flatten(1).sum(1)
-#     return ll_prior + delta_ll, {'fevals': fevals}
-
-
 class PIDStepSizeController:
-    """A PID controller for ODE adaptive step size control."""
+    """A PID controller for ODE adaptive step size control.
+
+    Implements a proportional-integral-derivative controller for adaptive step size selection
+    in numerical ODE integration.
+
+    Args:
+        h (float): Initial step size.
+        pcoeff (float): Proportional gain coefficient.
+        icoeff (float): Integral gain coefficient.
+        dcoeff (float): Derivative gain coefficient.
+        order (int, optional): Order of the integration method. Defaults to 1.
+        accept_safety (float, optional): Safety factor for step acceptance. Defaults to 0.81.
+        eps (float, optional): Small constant to prevent division by zero. Defaults to 1e-8.
+
+    Notes:
+        - Uses PID control theory to adapt integration step sizes
+        - Maintains history of error values for I and D terms
+        - Includes safety factors and limiters for robustness
+    """
     def __init__(self, h, pcoeff, icoeff, dcoeff, order=1, accept_safety=0.81, eps=1e-8):
         self.h = h
         self.b1 = (pcoeff + icoeff + dcoeff) / order
@@ -318,9 +558,25 @@ class PIDStepSizeController:
         self.errs = []
 
     def limiter(self, x):
+        """Apply limiting function to control factor.
+
+        Args:
+            x (float): Raw control factor.
+
+        Returns:
+            float: Limited control factor.
+        """
         return 1 + math.atan(x - 1)
 
     def propose_step(self, error):
+        """Propose new step size based on error estimate.
+
+        Args:
+            error (float): Error estimate from last step.
+
+        Returns:
+            bool: Whether to accept the step.
+        """
         inv_error = 1 / (float(error) + self.eps)
         if not self.errs:
             self.errs = [inv_error, inv_error, inv_error]
@@ -336,7 +592,30 @@ class PIDStepSizeController:
 
 
 class DPMSolver(nn.Module):
-    """DPM-Solver. See https://arxiv.org/abs/2206.00927."""
+    """DPM-Solver implementation following https://arxiv.org/abs/2206.00927.
+    
+    This class implements the DPM-Solver algorithm for sampling from diffusion models.
+    It provides multiple solver variants including 1-step, 2-step, and 3-step methods,
+    as well as adaptive step size control.
+
+    Args:
+        model (nn.Module): The score model to use for denoising
+        extra_args (dict, optional): Extra arguments to pass to model. Defaults to None.
+        eps_callback (callable, optional): Callback function called after each eps computation. Defaults to None.
+        info_callback (callable, optional): Callback function for logging solver info. Defaults to None.
+
+    Attributes:
+        model (nn.Module): The underlying score model
+        extra_args (dict): Extra arguments passed to model
+        eps_callback (callable): Callback after eps computation  
+        info_callback (callable): Callback for logging solver info
+
+    Notes:
+        - Implements both fixed step size and adaptive step size solvers
+        - Supports forward and reverse sampling directions
+        - Includes ancestral sampling variants with noise injection
+        - Based on the paper "DPM-Solver: A Fast ODE Solver for Diffusion Probabilistic Model Sampling"
+    """
 
     def __init__(self, model, extra_args=None, eps_callback=None, info_callback=None):
         super().__init__()
@@ -346,12 +625,41 @@ class DPMSolver(nn.Module):
         self.info_callback = info_callback
 
     def t(self, sigma):
+        """Convert noise level to time.
+
+        Args:
+            sigma (torch.Tensor): Noise level
+
+        Returns:
+            torch.Tensor: Corresponding time value
+        """
         return -sigma.log()
 
     def sigma(self, t):
+        """Convert time to noise level.
+
+        Args:
+            t (torch.Tensor): Time value
+
+        Returns:
+            torch.Tensor: Corresponding noise level
+        """
         return t.neg().exp()
 
     def eps(self, eps_cache, key, x, t, *args, **kwargs):
+        """Compute eps (noise prediction) with caching.
+
+        Args:
+            eps_cache (dict): Cache of previously computed eps values
+            key (str): Key for caching the computed eps
+            x (torch.Tensor): Input tensor
+            t (torch.Tensor): Time value
+            *args: Additional positional arguments for model
+            **kwargs: Additional keyword arguments for model
+
+        Returns:
+            tuple: (eps tensor, updated cache dict)
+        """
         if key in eps_cache:
             return eps_cache[key], eps_cache
         sigma = self.sigma(t) * x.new_ones([x.shape[0]])
@@ -361,6 +669,17 @@ class DPMSolver(nn.Module):
         return eps, {key: eps, **eps_cache}
 
     def dpm_solver_1_step(self, x, t, t_next, eps_cache=None):
+        """Single step DPM-Solver.
+
+        Args:
+            x (torch.Tensor): Current state
+            t (torch.Tensor): Current time
+            t_next (torch.Tensor): Next time
+            eps_cache (dict, optional): Cache of eps values. Defaults to None.
+
+        Returns:
+            tuple: (next state, updated eps cache)
+        """
         eps_cache = {} if eps_cache is None else eps_cache
         h = t_next - t
         eps, eps_cache = self.eps(eps_cache, 'eps', x, t)
@@ -368,6 +687,18 @@ class DPMSolver(nn.Module):
         return x_1, eps_cache
 
     def dpm_solver_2_step(self, x, t, t_next, r1=1 / 2, eps_cache=None):
+        """Two step DPM-Solver.
+
+        Args:
+            x (torch.Tensor): Current state
+            t (torch.Tensor): Current time 
+            t_next (torch.Tensor): Next time
+            r1 (float, optional): Intermediate step location. Defaults to 1/2.
+            eps_cache (dict, optional): Cache of eps values. Defaults to None.
+
+        Returns:
+            tuple: (next state, updated eps cache)
+        """
         eps_cache = {} if eps_cache is None else eps_cache
         h = t_next - t
         eps, eps_cache = self.eps(eps_cache, 'eps', x, t)
@@ -378,6 +709,19 @@ class DPMSolver(nn.Module):
         return x_2, eps_cache
 
     def dpm_solver_3_step(self, x, t, t_next, r1=1 / 3, r2=2 / 3, eps_cache=None):
+        """Three step DPM-Solver.
+
+        Args:
+            x (torch.Tensor): Current state
+            t (torch.Tensor): Current time
+            t_next (torch.Tensor): Next time
+            r1 (float, optional): First intermediate step location. Defaults to 1/3.
+            r2 (float, optional): Second intermediate step location. Defaults to 2/3.
+            eps_cache (dict, optional): Cache of eps values. Defaults to None.
+
+        Returns:
+            tuple: (next state, updated eps cache)
+        """
         eps_cache = {} if eps_cache is None else eps_cache
         h = t_next - t
         eps, eps_cache = self.eps(eps_cache, 'eps', x, t)
@@ -391,6 +735,23 @@ class DPMSolver(nn.Module):
         return x_3, eps_cache
 
     def dpm_solver_fast(self, x, t_start, t_end, nfe, eta=0., s_noise=1., noise_sampler=None):
+        """Fast DPM-Solver with fixed step size.
+
+        Args:
+            x (torch.Tensor): Initial state
+            t_start (torch.Tensor): Start time
+            t_end (torch.Tensor): End time
+            nfe (int): Number of function evaluations
+            eta (float, optional): Noise scale factor. Defaults to 0.
+            s_noise (float, optional): Noise scale. Defaults to 1.
+            noise_sampler (callable, optional): Custom noise sampler. Defaults to None.
+
+        Returns:
+            torch.Tensor: Final state
+
+        Raises:
+            ValueError: If eta != 0 for reverse sampling
+        """
         noise_sampler = default_noise_sampler(x) if noise_sampler is None else noise_sampler
         if not t_end > t_start and eta:
             raise ValueError('eta must be 0 for reverse sampling')
@@ -430,6 +791,30 @@ class DPMSolver(nn.Module):
         return x
 
     def dpm_solver_adaptive(self, x, t_start, t_end, order=3, rtol=0.05, atol=0.0078, h_init=0.05, pcoeff=0., icoeff=1., dcoeff=0., accept_safety=0.81, eta=0., s_noise=1., noise_sampler=None):
+        """Adaptive step size DPM-Solver.
+
+        Args:
+            x (torch.Tensor): Initial state
+            t_start (torch.Tensor): Start time
+            t_end (torch.Tensor): End time
+            order (int, optional): Solver order (2 or 3). Defaults to 3.
+            rtol (float, optional): Relative tolerance. Defaults to 0.05.
+            atol (float, optional): Absolute tolerance. Defaults to 0.0078.
+            h_init (float, optional): Initial step size. Defaults to 0.05.
+            pcoeff (float, optional): P coefficient for PID control. Defaults to 0.
+            icoeff (float, optional): I coefficient for PID control. Defaults to 1.
+            dcoeff (float, optional): D coefficient for PID control. Defaults to 0.
+            accept_safety (float, optional): Safety factor for step acceptance. Defaults to 0.81.
+            eta (float, optional): Noise scale factor. Defaults to 0.
+            s_noise (float, optional): Noise scale. Defaults to 1.
+            noise_sampler (callable, optional): Custom noise sampler. Defaults to None.
+
+        Returns:
+            tuple: (final state, info dict)
+
+        Raises:
+            ValueError: If order not in {2,3} or eta != 0 for reverse sampling
+        """
         noise_sampler = default_noise_sampler(x) if noise_sampler is None else noise_sampler
         if order not in {2, 3}:
             raise ValueError('order should be 2 or 3')
@@ -485,7 +870,29 @@ class DPMSolver(nn.Module):
 
 @torch.no_grad()
 def sample_dpm_fast(model, x, sigma_min, sigma_max, n, extra_args=None, callback=None, disable=None, eta=0., s_noise=1., noise_sampler=None):
-    """DPM-Solver-Fast (fixed step size). See https://arxiv.org/abs/2206.00927."""
+    """DPM-Solver-Fast with fixed step size.
+
+    A fast sampling method using DPM-Solver with fixed step sizes. See https://arxiv.org/abs/2206.00927 for details.
+
+    Args:
+        model: The model to sample from.
+        x (torch.Tensor): Initial noise tensor.
+        sigma_min (float): Minimum sigma/noise level.
+        sigma_max (float): Maximum sigma/noise level.
+        n (int): Number of sampling steps.
+        extra_args (dict, optional): Extra arguments to pass to the model. Defaults to None.
+        callback (callable, optional): Function called after each step with sampling info. Defaults to None.
+        disable (bool, optional): Whether to disable the progress bar. Defaults to None.
+        eta (float, optional): Noise scale factor. Must be 0 for reverse sampling. Defaults to 0.
+        s_noise (float, optional): Amount of noise to add each step. Defaults to 1.
+        noise_sampler (callable, optional): Function to sample noise. Defaults to None.
+
+    Returns:
+        torch.Tensor: The sampled output tensor.
+
+    Raises:
+        ValueError: If sigma_min or sigma_max is 0.
+    """
     if sigma_min <= 0 or sigma_max <= 0:
         raise ValueError('sigma_min and sigma_max must not be 0')
     with tqdm(total=n, disable=disable) as pbar:
@@ -497,7 +904,37 @@ def sample_dpm_fast(model, x, sigma_min, sigma_max, n, extra_args=None, callback
 
 @torch.no_grad()
 def sample_dpm_adaptive(model, x, sigma_min, sigma_max, extra_args=None, callback=None, disable=None, order=3, rtol=0.05, atol=0.0078, h_init=0.05, pcoeff=0., icoeff=1., dcoeff=0., accept_safety=0.81, eta=0., s_noise=1., noise_sampler=None, return_info=False):
-    """DPM-Solver-12 and 23 (adaptive step size). See https://arxiv.org/abs/2206.00927."""
+    """DPM-Solver-12 and 23 with adaptive step size.
+
+    An adaptive step size sampling method using DPM-Solver orders 12 and 23. See https://arxiv.org/abs/2206.00927 for details.
+
+    Args:
+        model: The model to sample from.
+        x (torch.Tensor): Initial noise tensor.
+        sigma_min (float): Minimum sigma/noise level.
+        sigma_max (float): Maximum sigma/noise level.
+        extra_args (dict, optional): Extra arguments to pass to the model. Defaults to None.
+        callback (callable, optional): Function called after each step with sampling info. Defaults to None.
+        disable (bool, optional): Whether to disable the progress bar. Defaults to None.
+        order (int, optional): Order of solver (2 or 3). Defaults to 3.
+        rtol (float, optional): Relative tolerance for step size control. Defaults to 0.05.
+        atol (float, optional): Absolute tolerance for step size control. Defaults to 0.0078.
+        h_init (float, optional): Initial step size. Defaults to 0.05.
+        pcoeff (float, optional): Proportional coefficient for PID controller. Defaults to 0.
+        icoeff (float, optional): Integral coefficient for PID controller. Defaults to 1.
+        dcoeff (float, optional): Derivative coefficient for PID controller. Defaults to 0.
+        accept_safety (float, optional): Safety factor for step acceptance. Defaults to 0.81.
+        eta (float, optional): Noise scale factor. Must be 0 for reverse sampling. Defaults to 0.
+        s_noise (float, optional): Amount of noise to add each step. Defaults to 1.
+        noise_sampler (callable, optional): Function to sample noise. Defaults to None.
+        return_info (bool, optional): Whether to return solver statistics. Defaults to False.
+
+    Returns:
+        Union[torch.Tensor, Tuple[torch.Tensor, dict]]: The sampled output tensor, and optionally solver statistics.
+
+    Raises:
+        ValueError: If sigma_min or sigma_max is 0.
+    """
     if sigma_min <= 0 or sigma_max <= 0:
         raise ValueError('sigma_min and sigma_max must not be 0')
     with tqdm(disable=disable) as pbar:
@@ -512,7 +949,24 @@ def sample_dpm_adaptive(model, x, sigma_min, sigma_max, extra_args=None, callbac
 
 @torch.no_grad()
 def sample_dpmpp_2s_ancestral(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None):
-    """Ancestral sampling with DPM-Solver++(2S) second-order steps."""
+    """Ancestral sampling with DPM-Solver++(2S) second-order steps.
+
+    A sampling method combining ancestral sampling with DPM-Solver++(2S) second-order steps.
+
+    Args:
+        model: The model to sample from.
+        x (torch.Tensor): Initial noise tensor.
+        sigmas (torch.Tensor): Sequence of noise levels.
+        extra_args (dict, optional): Extra arguments to pass to the model. Defaults to None.
+        callback (callable, optional): Function called after each step with sampling info. Defaults to None.
+        disable (bool, optional): Whether to disable the progress bar. Defaults to None.
+        eta (float, optional): Noise scale factor. Defaults to 1.
+        s_noise (float, optional): Amount of noise to add each step. Defaults to 1.
+        noise_sampler (callable, optional): Function to sample noise. Defaults to None.
+
+    Returns:
+        torch.Tensor: The sampled output tensor.
+    """
     extra_args = {} if extra_args is None else extra_args
     noise_sampler = default_noise_sampler(x) if noise_sampler is None else noise_sampler
     s_in = x.new_ones([x.shape[0]])
@@ -546,7 +1000,25 @@ def sample_dpmpp_2s_ancestral(model, x, sigmas, extra_args=None, callback=None, 
 
 @torch.no_grad()
 def sample_dpmpp_sde(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None, r=1 / 2):
-    """DPM-Solver++ (stochastic)."""
+    """DPM-Solver++ (stochastic).
+
+    A stochastic sampling method using DPM-Solver++.
+
+    Args:
+        model: The model to sample from.
+        x (torch.Tensor): Initial noise tensor.
+        sigmas (torch.Tensor): Sequence of noise levels.
+        extra_args (dict, optional): Extra arguments to pass to the model. Defaults to None.
+        callback (callable, optional): Function called after each step with sampling info. Defaults to None.
+        disable (bool, optional): Whether to disable the progress bar. Defaults to None.
+        eta (float, optional): Noise scale factor. Defaults to 1.
+        s_noise (float, optional): Amount of noise to add each step. Defaults to 1.
+        noise_sampler (callable, optional): Function to sample noise. Defaults to None.
+        r (float, optional): Step size multiplier. Defaults to 1/2.
+
+    Returns:
+        torch.Tensor: The sampled output tensor.
+    """
     sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
     noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max) if noise_sampler is None else noise_sampler
     extra_args = {} if extra_args is None else extra_args
@@ -588,7 +1060,21 @@ def sample_dpmpp_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
 
 @torch.no_grad()
 def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=None):
-    """DPM-Solver++(2M)."""
+    """DPM-Solver++(2M).
+
+    A sampling method using DPM-Solver++(2M).
+
+    Args:
+        model: The model to sample from.
+        x (torch.Tensor): Initial noise tensor.
+        sigmas (torch.Tensor): Sequence of noise levels.
+        extra_args (dict, optional): Extra arguments to pass to the model. Defaults to None.
+        callback (callable, optional): Function called after each step with sampling info. Defaults to None.
+        disable (bool, optional): Whether to disable the progress bar. Defaults to None.
+
+    Returns:
+        torch.Tensor: The sampled output tensor.
+    """
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
     sigma_fn = lambda t: t.neg().exp()
@@ -614,7 +1100,28 @@ def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=No
 
 @torch.no_grad()
 def sample_dpmpp_2m_sde(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None, solver_type='midpoint'):
-    """DPM-Solver++(2M) SDE."""
+    """DPM-Solver++(2M) SDE sampling method.
+
+    A sampling method using DPM-Solver++(2M) with stochastic differential equations (SDE).
+
+    Args:
+        model: A model that takes in noisy samples and noise levels and returns denoised samples.
+        x (torch.Tensor): Initial noise tensor to start sampling from.
+        sigmas (torch.Tensor): Sequence of noise levels defining the diffusion process.
+        extra_args (dict, optional): Extra arguments to pass to the model. Defaults to None.
+        callback (callable, optional): Function called after each step with sampling info. Defaults to None.
+        disable (bool, optional): Whether to disable the progress bar. Defaults to None.
+        eta (float, optional): Parameter controlling the stochastic noise. Set to 0 for deterministic sampling. Defaults to 1.0.
+        s_noise (float, optional): Scale factor for the noise. Defaults to 1.0.
+        noise_sampler (callable, optional): Function to sample noise. If None, uses BrownianTreeNoiseSampler. Defaults to None.
+        solver_type (str, optional): Type of solver to use - either 'heun' or 'midpoint'. Defaults to 'midpoint'.
+
+    Returns:
+        torch.Tensor: The sampled output tensor.
+
+    Raises:
+        ValueError: If solver_type is not 'heun' or 'midpoint'.
+    """
 
     if solver_type not in {'heun', 'midpoint'}:
         raise ValueError('solver_type must be \'heun\' or \'midpoint\'')
@@ -659,7 +1166,25 @@ def sample_dpmpp_2m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
 
 @torch.no_grad()
 def sample_dpmpp_3m_sde(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None):
-    """DPM-Solver++(3M) SDE."""
+    """DPM-Solver++(3M) SDE sampling method.
+
+    A sampling method using DPM-Solver++(3M) with stochastic differential equations (SDE). This is a higher-order variant
+    of DPM-Solver++(2M) that uses three previous model evaluations for better accuracy.
+
+    Args:
+        model: A model that takes in noisy samples and noise levels and returns denoised samples.
+        x (torch.Tensor): Initial noise tensor to start sampling from.
+        sigmas (torch.Tensor): Sequence of noise levels defining the diffusion process.
+        extra_args (dict, optional): Extra arguments to pass to the model. Defaults to None.
+        callback (callable, optional): Function called after each step with sampling info. Defaults to None.
+        disable (bool, optional): Whether to disable the progress bar. Defaults to None.
+        eta (float, optional): Parameter controlling the stochastic noise. Set to 0 for deterministic sampling. Defaults to 1.0.
+        s_noise (float, optional): Scale factor for the noise. Defaults to 1.0.
+        noise_sampler (callable, optional): Function to sample noise. If None, uses BrownianTreeNoiseSampler. Defaults to None.
+
+    Returns:
+        torch.Tensor: The sampled output tensor.
+    """
 
     sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
     noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max) if noise_sampler is None else noise_sampler

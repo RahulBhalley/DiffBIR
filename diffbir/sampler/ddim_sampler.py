@@ -1,3 +1,14 @@
+"""
+DDIM (Denoising Diffusion Implicit Models) sampler implementation.
+
+This module implements the DDIM sampling algorithm from the paper:
+"Denoising Diffusion Implicit Models" (Song et al., 2020).
+https://arxiv.org/abs/2010.02502
+
+The DDIM sampler allows for deterministic and non-Markovian sampling from
+diffusion models, with a controllable trade-off between speed and sample quality.
+"""
+
 from typing import Optional, Tuple, Dict, Literal
 
 import torch
@@ -16,6 +27,20 @@ def make_ddim_timesteps(
     num_ddpm_timesteps: int,
     verbose: bool = True,
 ) -> np.ndarray:
+    """Generate DDIM timesteps based on a discretization method.
+
+    Args:
+        ddim_discr_method: Discretization method, either "uniform" or "quad".
+        num_ddim_timesteps: Number of desired timesteps to use in DDIM sampling.
+        num_ddpm_timesteps: Number of timesteps used in the original DDPM training.
+        verbose: Whether to print selected timesteps.
+
+    Returns:
+        np.ndarray: Array of timesteps to use for DDIM sampling.
+
+    Raises:
+        NotImplementedError: If ddim_discr_method is not "uniform" or "quad".
+    """
     if ddim_discr_method == "uniform":
         c = num_ddpm_timesteps // num_ddim_timesteps
         ddim_timesteps = np.asarray(list(range(0, num_ddpm_timesteps, c)))
@@ -28,8 +53,6 @@ def make_ddim_timesteps(
             f'There is no ddim discretization method called "{ddim_discr_method}"'
         )
 
-    # assert ddim_timesteps.shape[0] == num_ddim_timesteps
-    # add one to get the final alpha values right (the ones from first scale to data during sampling)
     steps_out = ddim_timesteps + 1
     if verbose:
         print(f"Selected timesteps for ddim sampler: {steps_out}")
@@ -39,11 +62,23 @@ def make_ddim_timesteps(
 def make_ddim_sampling_parameters(
     alphacums: np.ndarray, ddim_timesteps: np.ndarray, eta: float, verbose: bool = True
 ) -> Tuple[np.ndarray]:
-    # select alphas for computing the variance schedule
+    """Calculate the DDIM sampling parameters.
+
+    Args:
+        alphacums: Cumulative products of alphas used in diffusion.
+        ddim_timesteps: Timesteps selected for DDIM sampling.
+        eta: Parameter controlling the stochasticity of the sampler.
+        verbose: Whether to print selected parameters.
+
+    Returns:
+        Tuple containing:
+            - sigmas: Standard deviations for the sampling process
+            - alphas: Alpha values at selected timesteps
+            - alphas_prev: Alpha values at previous timesteps
+    """
     alphas = alphacums[ddim_timesteps]
     alphas_prev = np.asarray([alphacums[0]] + alphacums[ddim_timesteps[:-1]].tolist())
 
-    # according the the formula provided in https://arxiv.org/abs/2010.02502
     sigmas = eta * np.sqrt(
         (1 - alphas_prev) / (1 - alphas) * (1 - alphas / alphas_prev)
     )
@@ -59,6 +94,18 @@ def make_ddim_sampling_parameters(
 
 
 class DDIMSampler(Sampler):
+    """DDIM Sampler implementation.
+
+    This class implements the DDIM sampling algorithm, extending the base Sampler class.
+    It provides methods for generating samples using the DDIM process with optional
+    classifier-free guidance.
+
+    Args:
+        betas: Array of beta values used in the diffusion process.
+        parameterization: Type of model output parameterization ("eps" or "v").
+        rescale_cfg: Whether to rescale classifier-free guidance.
+        eta: Parameter controlling the stochasticity (0 = deterministic, 1 = full stochastic).
+    """
 
     def __init__(
         self,
@@ -75,6 +122,12 @@ class DDIMSampler(Sampler):
         ddim_num_steps,
         ddim_discretize="uniform",
     ):
+        """Create a sampling schedule for the DDIM process.
+
+        Args:
+            ddim_num_steps: Number of DDIM sampling steps.
+            ddim_discretize: Method for discretizing timesteps ("uniform" or "quad").
+        """
         self.ddim_timesteps = make_ddim_timesteps(
             ddim_discr_method=ddim_discretize,
             num_ddim_timesteps=ddim_num_steps,
@@ -82,7 +135,6 @@ class DDIMSampler(Sampler):
             verbose=False,
         )
         original_alphas_cumprod = self.training_alphas_cumprod
-        # ddim sampling parameters
         ddim_sigmas, ddim_alphas, ddim_alphas_prev = make_ddim_sampling_parameters(
             alphacums=original_alphas_cumprod,
             ddim_timesteps=self.ddim_timesteps,
@@ -96,6 +148,16 @@ class DDIMSampler(Sampler):
         self.register("ddim_sqrt_one_minus_alphas", np.sqrt(1.0 - ddim_alphas))
 
     def predict_eps_from_z_and_v(self, x_t, t, v):
+        """Predict noise (epsilon) from the model's v-prediction.
+
+        Args:
+            x_t: Input tensor at timestep t.
+            t: Current timestep.
+            v: Model's v-prediction.
+
+        Returns:
+            Predicted noise epsilon.
+        """
         return (
             extract_into_tensor(self.ddim_sqrt_alphas, t, x_t.shape) * v
             + extract_into_tensor(self.ddim_sqrt_one_minus_alphas, t, x_t.shape) * x_t
@@ -112,6 +174,20 @@ class DDIMSampler(Sampler):
         uncond: Optional[Dict[str, torch.Tensor]],
         cfg_scale: float,
     ) -> torch.Tensor:
+        """Perform one DDIM sampling step.
+
+        Args:
+            model: The ControlLDM model.
+            x: Current tensor at timestep t.
+            model_t: Timestep tensor for model input.
+            t: Current sampling timestep.
+            cond: Conditioning inputs.
+            uncond: Unconditional inputs for classifier-free guidance.
+            cfg_scale: Classifier-free guidance scale.
+
+        Returns:
+            The predicted tensor for the previous timestep.
+        """
         if uncond is None or cfg_scale == 1.0:
             model_output = model(x, model_t, cond)
         else:
@@ -129,16 +205,12 @@ class DDIMSampler(Sampler):
         alphas_prev = self.ddim_alphas_prev
         sqrt_one_minus_alphas = self.ddim_sqrt_one_minus_alphas
         sigmas = self.ddim_sigmas
-        # select parameters corresponding to the currently considered timestep
         a_t = extract_into_tensor(alphas, t, x.shape)
         a_prev = extract_into_tensor(alphas_prev, t, x.shape)
         sigma_t = extract_into_tensor(sigmas, t, x.shape)
         sqrt_one_minus_at = extract_into_tensor(sqrt_one_minus_alphas, t, x.shape)
 
-        # current prediction for x_0
         pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
-
-        # direction pointing to x_t
         dir_xt = (1.0 - a_prev - sigma_t**2).sqrt() * e_t
         noise = sigma_t * torch.randn_like(x)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
@@ -160,6 +232,25 @@ class DDIMSampler(Sampler):
         x_T: torch.Tensor | None = None,
         progress: bool = True,
     ) -> torch.Tensor:
+        """Generate samples using DDIM sampling.
+
+        Args:
+            model: The ControlLDM model.
+            device: Device to run sampling on.
+            steps: Number of sampling steps.
+            x_size: Size of the output tensor.
+            cond: Conditioning inputs.
+            uncond: Unconditional inputs for classifier-free guidance.
+            cfg_scale: Classifier-free guidance scale.
+            tiled: Whether to use tiled sampling.
+            tile_size: Size of tiles if using tiled sampling.
+            tile_stride: Stride of tiles if using tiled sampling.
+            x_T: Optional starting noise tensor.
+            progress: Whether to show progress bar.
+
+        Returns:
+            Generated sample tensor.
+        """
         self.make_schedule(ddim_num_steps=steps)
         self.to(device)
         if tiled:
