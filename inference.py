@@ -1,3 +1,23 @@
+"""Main script for running DiffBIR inference on images.
+
+This module provides command-line interface and configuration for running
+DiffBIR (Blind Image Restoration) inference using different models and settings.
+It supports multiple restoration tasks including super-resolution, face restoration,
+denoising etc.
+
+Example:
+    Basic usage for super-resolution::
+
+        $ python inference.py --task sr --input path/to/images --output path/to/results
+
+    Face restoration with guidance::
+
+        $ python inference.py --task face --guidance --input faces/ --output restored/
+
+The script handles device selection, model loading, and inference configuration through
+command line arguments. See parse_args() for full list of options.
+"""
+
 from argparse import ArgumentParser, Namespace
 
 import torch
@@ -12,6 +32,22 @@ from diffbir.inference import (
 
 
 def check_device(device: str) -> str:
+    """Check and validate the requested compute device.
+
+    Verifies if the requested device (CUDA/MPS/CPU) is available and falls back
+    to CPU if necessary.
+
+    Args:
+        device: Requested compute device ('cuda', 'mps', or 'cpu')
+
+    Returns:
+        str: Name of the actual device to use
+
+    Note:
+        - For CUDA, checks if PyTorch was built with CUDA support
+        - For MPS (Metal Performance Shaders), checks both PyTorch build and MacOS version
+        - Falls back to CPU if requested device is unavailable
+    """
     if device == "cuda":
         if not torch.cuda.is_available():
             print(
@@ -38,12 +74,14 @@ def check_device(device: str) -> str:
     return device
 
 
+# Default positive prompt emphasizing high quality photographic attributes
 DEFAULT_POS_PROMPT = (
     "Cinematic, High Contrast, highly detailed, taken using a Canon EOS R camera, "
     "hyper detailed photo - realistic maximum detail, 32k, Color Grading, ultra HD, extreme meticulous detailing, "
     "skin pore detailing, hyper sharpness, perfect without deformations."
 )
 
+# Default negative prompt listing undesired image characteristics
 DEFAULT_NEG_PROMPT = (
     "painting, oil painting, illustration, drawing, art, sketch, oil painting, cartoon, "
     "CG Style, 3D render, unreal engine, blurring, dirty, messy, worst quality, low quality, frames, watermark, "
@@ -52,6 +90,18 @@ DEFAULT_NEG_PROMPT = (
 
 
 def parse_args() -> Namespace:
+    """Parse command line arguments for DiffBIR inference.
+
+    Returns:
+        Namespace: Parsed arguments containing all inference settings
+
+    The following groups of arguments are supported:
+        - Model parameters (task, upscale factor, model version)
+        - Sampling parameters (sampler type, steps, tiling settings)
+        - Prompt parameters (captioner, positive/negative prompts)
+        - Guidance parameters (loss type, scale)
+        - Common parameters (input/output paths, device, precision)
+    """
     parser = ArgumentParser()
     # model parameters
     parser.add_argument(
@@ -275,6 +325,14 @@ def parse_args() -> Namespace:
 
 
 def main():
+    """Main entry point for DiffBIR inference.
+
+    Handles:
+        1. Argument parsing
+        2. Device selection and validation
+        3. Random seed setting
+        4. Inference loop selection and execution based on task
+    """
     args = parse_args()
     args.device = check_device(args.device)
     set_seed(args.seed)
