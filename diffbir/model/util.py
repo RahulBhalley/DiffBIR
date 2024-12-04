@@ -1,12 +1,15 @@
-# adopted from
-# https://github.com/openai/improved-diffusion/blob/main/improved_diffusion/gaussian_diffusion.py
-# and
-# https://github.com/lucidrains/denoising-diffusion-pytorch/blob/7706bdfc6f527f58d33f84b7b522e61e6e3164b3/denoising_diffusion_pytorch/denoising_diffusion_pytorch.py
-# and
-# https://github.com/openai/guided-diffusion/blob/0ba878e517b276c45d1195eb29f6f5f72659a05b/guided_diffusion/nn.py
-#
-# thanks!
+"""
+Utility functions and modules for deep learning models.
 
+This module contains various helper functions and custom PyTorch modules used across
+the codebase, particularly for diffusion models. Many functions are adapted from
+multiple open source implementations.
+
+Adapted from:
+- https://github.com/openai/improved-diffusion
+- https://github.com/lucidrains/denoising-diffusion-pytorch
+- https://github.com/openai/guided-diffusion
+"""
 
 import os
 import math
@@ -18,24 +21,46 @@ from einops import repeat
 
 
 def exists(val):
+    """Check if a value exists (is not None).
+
+    Args:
+        val: Any value to check
+
+    Returns:
+        bool: True if value is not None, False otherwise
+    """
     return val is not None
 
 
 def default(val, d):
+    """Return a default value if the input value doesn't exist.
+
+    Args:
+        val: Value to check
+        d: Default value or callable that returns default value
+
+    Returns:
+        Input value if it exists, otherwise the default value
+    """
     if exists(val):
         return val
     return d() if isfunction(d) else d
 
 
 def checkpoint(func, inputs, params, flag):
-    """
-    Evaluate a function without caching intermediate activations, allowing for
-    reduced memory at the expense of extra compute in the backward pass.
-    :param func: the function to evaluate.
-    :param inputs: the argument sequence to pass to `func`.
-    :param params: a sequence of parameters `func` depends on but does not
-                   explicitly take as arguments.
-    :param flag: if False, disable gradient checkpointing.
+    """Evaluate a function with gradient checkpointing.
+
+    Allows for reduced memory usage during training by not caching intermediate
+    activations, at the cost of extra compute in the backward pass.
+
+    Args:
+        func: Function to evaluate
+        inputs: Sequence of input arguments for the function
+        params: Sequence of parameters the function depends on
+        flag: If False, disable gradient checkpointing
+
+    Returns:
+        Output of the function evaluation
     """
     if flag:
         args = tuple(inputs) + tuple(params)
@@ -44,47 +69,27 @@ def checkpoint(func, inputs, params, flag):
         return func(*inputs)
 
 
-# class CheckpointFunction(torch.autograd.Function):
-#     @staticmethod
-#     def forward(ctx, run_function, length, *args):
-#         ctx.run_function = run_function
-#         ctx.input_tensors = list(args[:length])
-#         ctx.input_params = list(args[length:])
-#         ctx.gpu_autocast_kwargs = {"enabled": torch.is_autocast_enabled(),
-#                                    "dtype": torch.get_autocast_gpu_dtype(),
-#                                    "cache_enabled": torch.is_autocast_cache_enabled()}
-#         with torch.no_grad():
-#             output_tensors = ctx.run_function(*ctx.input_tensors)
-#         return output_tensors
-
-#     @staticmethod
-#     def backward(ctx, *output_grads):
-#         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
-#         with torch.enable_grad(), \
-#                 torch.cuda.amp.autocast(**ctx.gpu_autocast_kwargs):
-#             # Fixes a bug where the first op in run_function modifies the
-#             # Tensor storage in place, which is not allowed for detach()'d
-#             # Tensors.
-#             shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
-#             output_tensors = ctx.run_function(*shallow_copies)
-#         input_grads = torch.autograd.grad(
-#             output_tensors,
-#             ctx.input_tensors + ctx.input_params,
-#             output_grads,
-#             allow_unused=True,
-#         )
-#         del ctx.input_tensors
-#         del ctx.input_params
-#         del output_tensors
-#         return (None, None) + input_grads
-
-
-# Fixes: When we set unet parameters with requires_grad=False, the original CheckpointFunction
-# still tries to compute gradient for unet parameters.
-# https://discuss.pytorch.org/t/get-runtimeerror-one-of-the-differentiated-tensors-does-not-require-grad-in-pytorch-lightning/179738/6
 class CheckpointFunction(torch.autograd.Function):
+    """Custom autograd function implementing gradient checkpointing.
+
+    This implementation properly handles parameters that don't require gradients,
+    fixing issues with the original implementation when some model parameters
+    have requires_grad=False.
+    """
+
     @staticmethod
     def forward(ctx, run_function, length, *args):
+        """Forward pass of checkpointing.
+
+        Args:
+            ctx: Context object to store information for backward pass
+            run_function: Function to run
+            length: Number of input tensors
+            *args: Input tensors and parameters
+
+        Returns:
+            Output tensors from run_function
+        """
         ctx.run_function = run_function
         ctx.input_tensors = list(args[:length])
         ctx.input_params = list(args[length:])
@@ -97,12 +102,18 @@ class CheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *output_grads):
+        """Backward pass of checkpointing.
+
+        Args:
+            ctx: Context object with stored information
+            *output_grads: Gradients of the loss with respect to outputs
+
+        Returns:
+            Tuple of gradients for all inputs
+        """
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
         with torch.enable_grad(), \
                 torch.cuda.amp.autocast(**ctx.gpu_autocast_kwargs):
-            # Fixes a bug where the first op in run_function modifies the
-            # Tensor storage in place, which is not allowed for detach()'d
-            # Tensors.
             shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
             output_tensors = ctx.run_function(*shallow_copies)
         grads = torch.autograd.grad(
@@ -112,13 +123,12 @@ class CheckpointFunction(torch.autograd.Function):
             allow_unused=True,
         )
         grads = list(grads)
-        # Assign gradients to the correct positions, matching None for those that do not require gradients
         input_grads = []
         for tensor in ctx.input_tensors + ctx.input_params:
             if tensor.requires_grad:
-                input_grads.append(grads.pop(0))  # Get the next computed gradient
+                input_grads.append(grads.pop(0))
             else:
-                input_grads.append(None)  # No gradient required for this tensor
+                input_grads.append(None)
         del ctx.input_tensors
         del ctx.input_params
         del output_tensors
@@ -126,13 +136,16 @@ class CheckpointFunction(torch.autograd.Function):
 
 
 def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
-    """
-    Create sinusoidal timestep embeddings.
-    :param timesteps: a 1-D Tensor of N indices, one per batch element.
-                      These may be fractional.
-    :param dim: the dimension of the output.
-    :param max_period: controls the minimum frequency of the embeddings.
-    :return: an [N x dim] Tensor of positional embeddings.
+    """Create sinusoidal timestep embeddings.
+
+    Args:
+        timesteps: 1-D tensor of N indices, one per batch element
+        dim: Dimension of the output embeddings
+        max_period: Controls the minimum frequency of the embeddings
+        repeat_only: If True, just repeat the timesteps dim times
+
+    Returns:
+        torch.Tensor: [N x dim] tensor of positional embeddings
     """
     if not repeat_only:
         half = dim // 2
@@ -149,8 +162,13 @@ def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
 
 
 def zero_module(module):
-    """
-    Zero out the parameters of a module and return it.
+    """Zero out the parameters of a module.
+
+    Args:
+        module: PyTorch module
+
+    Returns:
+        The module with zeroed parameters
     """
     for p in module.parameters():
         p.detach().zero_()
@@ -158,8 +176,14 @@ def zero_module(module):
 
 
 def scale_module(module, scale):
-    """
-    Scale the parameters of a module and return it.
+    """Scale the parameters of a module.
+
+    Args:
+        module: PyTorch module
+        scale: Scaling factor
+
+    Returns:
+        The module with scaled parameters
     """
     for p in module.parameters():
         p.detach().mul_(scale)
@@ -167,34 +191,56 @@ def scale_module(module, scale):
 
 
 def mean_flat(tensor):
-    """
-    Take the mean over all non-batch dimensions.
+    """Take the mean over all non-batch dimensions.
+
+    Args:
+        tensor: Input tensor
+
+    Returns:
+        Tensor with mean taken over all non-batch dimensions
     """
     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
 
 def normalization(channels):
-    """
-    Make a standard normalization layer.
-    :param channels: number of input channels.
-    :return: an nn.Module for normalization.
+    """Create a standard normalization layer.
+
+    Args:
+        channels: Number of input channels
+
+    Returns:
+        nn.Module: GroupNorm32 normalization module
     """
     return GroupNorm32(32, channels)
 
 
-# PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
 class SiLU(nn.Module):
+    """SiLU activation function compatible with PyTorch < 1.7."""
+    
     def forward(self, x):
         return x * torch.sigmoid(x)
 
 
 class GroupNorm32(nn.GroupNorm):
+    """GroupNorm with float32 conversion for improved precision."""
+    
     def forward(self, x):
         return super().forward(x.float()).type(x.dtype)
 
+
 def conv_nd(dims, *args, **kwargs):
-    """
-    Create a 1D, 2D, or 3D convolution module.
+    """Create a 1D, 2D, or 3D convolution module.
+
+    Args:
+        dims: Number of dimensions (1, 2, or 3)
+        *args: Arguments to pass to convolution constructor
+        **kwargs: Keyword arguments to pass to convolution constructor
+
+    Returns:
+        nn.Module: Convolution module of requested dimensionality
+
+    Raises:
+        ValueError: If dims is not 1, 2, or 3
     """
     if dims == 1:
         return nn.Conv1d(*args, **kwargs)
@@ -206,15 +252,31 @@ def conv_nd(dims, *args, **kwargs):
 
 
 def linear(*args, **kwargs):
-    """
-    Create a linear module.
+    """Create a linear module.
+
+    Args:
+        *args: Arguments to pass to nn.Linear
+        **kwargs: Keyword arguments to pass to nn.Linear
+
+    Returns:
+        nn.Linear module
     """
     return nn.Linear(*args, **kwargs)
 
 
 def avg_pool_nd(dims, *args, **kwargs):
-    """
-    Create a 1D, 2D, or 3D average pooling module.
+    """Create a 1D, 2D, or 3D average pooling module.
+
+    Args:
+        dims: Number of dimensions (1, 2, or 3)
+        *args: Arguments to pass to pooling constructor
+        **kwargs: Keyword arguments to pass to pooling constructor
+
+    Returns:
+        nn.Module: Average pooling module of requested dimensionality
+
+    Raises:
+        ValueError: If dims is not 1, 2, or 3
     """
     if dims == 1:
         return nn.AvgPool1d(*args, **kwargs)

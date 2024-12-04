@@ -18,6 +18,27 @@ def disabled_train(self: nn.Module) -> nn.Module:
 
 
 class ControlLDM(nn.Module):
+    """A controlled latent diffusion model that combines UNet, VAE, CLIP and ControlNet.
+
+    This model implements a controlled version of Stable Diffusion that allows conditioning
+    on both text and image inputs. It uses a ControlNet to process the image condition
+    and modulate the main UNet diffusion model.
+
+    Args:
+        unet_cfg: Configuration dictionary for the controlled UNet model
+        vae_cfg: Configuration dictionary for the VAE model
+        clip_cfg: Configuration dictionary for the CLIP text encoder
+        controlnet_cfg: Configuration dictionary for the ControlNet
+        latent_scale_factor: Scaling factor applied to the latent space
+
+    Attributes:
+        unet (ControlledUnetModel): The main controlled UNet diffusion model
+        vae (AutoencoderKL): VAE model for encoding/decoding images
+        clip (FrozenOpenCLIPEmbedder): CLIP model for text encoding
+        controlnet (ControlNet): ControlNet for processing image conditions
+        scale_factor (float): Scaling factor for the latent space
+        control_scales (List[float]): Scaling factors for each ControlNet layer output
+    """
 
     def __init__(
         self, unet_cfg, vae_cfg, clip_cfg, controlnet_cfg, latent_scale_factor
@@ -34,6 +55,20 @@ class ControlLDM(nn.Module):
     def load_pretrained_sd(
         self, sd: Dict[str, torch.Tensor]
     ) -> Tuple[Set[str], Set[str]]:
+        """Load pretrained state dict into UNet, VAE and CLIP models.
+
+        Args:
+            sd: State dictionary containing pretrained weights
+
+        Returns:
+            A tuple containing:
+                - Set of unused keys from the state dict
+                - Set of missing keys that were not found in state dict
+
+        Note:
+            After loading, all models are set to eval mode and their parameters
+            are frozen by disabling gradients.
+        """
         module_map = {
             "unet": "model.diffusion_model",
             "vae": "first_stage_model",
@@ -63,10 +98,25 @@ class ControlLDM(nn.Module):
 
     @torch.no_grad()
     def load_controlnet_from_ckpt(self, sd: Dict[str, torch.Tensor]) -> None:
+        """Load ControlNet weights from a checkpoint state dict.
+
+        Args:
+            sd: State dictionary containing ControlNet weights
+        """
         self.controlnet.load_state_dict(sd, strict=True)
 
     @torch.no_grad()
     def load_controlnet_from_unet(self) -> Tuple[Set[str]]:
+        """Initialize ControlNet weights from the UNet.
+
+        For matching layers, copies weights from UNet. For layers with different sizes,
+        pads with zeros. For unique ControlNet layers, keeps original initialization.
+
+        Returns:
+            A tuple containing:
+                - Set of keys that were initialized with zero padding
+                - Set of keys that kept their original initialization
+        """
         unet_sd = self.unet.state_dict()
         scratch_sd = self.controlnet.state_dict()
         init_sd = {}
@@ -96,6 +146,17 @@ class ControlLDM(nn.Module):
         tiled: bool = False,
         tile_size: int = -1,
     ) -> torch.Tensor:
+        """Encode images to latent space using the VAE.
+
+        Args:
+            image: Input image tensor
+            sample: If True, sample from the posterior, otherwise use the mode
+            tiled: If True, process image in tiles to reduce memory usage
+            tile_size: Size of tiles when tiled=True
+
+        Returns:
+            Latent representation of the input image
+        """
         if tiled:
             def encoder(x: torch.Tensor) -> DiagonalGaussianDistribution:
                 h = VAEHook(
@@ -124,6 +185,16 @@ class ControlLDM(nn.Module):
         tiled: bool = False,
         tile_size: int = -1,
     ) -> torch.Tensor:
+        """Decode latent representations to images using the VAE.
+
+        Args:
+            z: Input latent tensor
+            tiled: If True, process in tiles to reduce memory usage
+            tile_size: Size of tiles when tiled=True
+
+        Returns:
+            Decoded image tensor
+        """
         if tiled:
             def decoder(z):
                 z = self.vae.post_quant_conv(z)
@@ -147,6 +218,17 @@ class ControlLDM(nn.Module):
         tiled: bool = False,
         tile_size: int = -1,
     ) -> Dict[str, torch.Tensor]:
+        """Prepare text and image conditions for the model.
+
+        Args:
+            cond_img: Conditioning image tensor
+            txt: List of text prompts
+            tiled: If True, use tiled VAE encoding
+            tile_size: Size of tiles when tiled=True
+
+        Returns:
+            Dictionary containing encoded text and image conditions
+        """
         return dict(
             c_txt=self.clip.encode(txt),
             c_img=self.vae_encode(
@@ -158,6 +240,16 @@ class ControlLDM(nn.Module):
         )
 
     def forward(self, x_noisy, t, cond):
+        """Forward pass of the model.
+
+        Args:
+            x_noisy: Noisy input tensor
+            t: Timestep tensor
+            cond: Dictionary containing text and image conditions
+
+        Returns:
+            Predicted noise tensor
+        """
         c_txt = cond["c_txt"]
         c_img = cond["c_img"]
         control = self.controlnet(x=x_noisy, hint=c_img, timesteps=t, context=c_txt)
@@ -172,6 +264,14 @@ class ControlLDM(nn.Module):
         return eps
 
     def cast_dtype(self, dtype: torch.dtype) -> "ControlLDM":
+        """Cast model parameters to specified dtype, keeping GroupNorm32 in float32.
+
+        Args:
+            dtype: Target dtype for model parameters
+
+        Returns:
+            Self for method chaining
+        """
         self.unet.dtype = dtype
         self.controlnet.dtype = dtype
         # convert unet blocks to dtype

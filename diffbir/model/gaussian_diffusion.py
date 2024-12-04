@@ -7,8 +7,31 @@ import numpy as np
 
 
 def make_beta_schedule(
-    schedule, n_timestep, linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3
-):
+    schedule: str,
+    n_timestep: int,
+    linear_start: float = 1e-4,
+    linear_end: float = 2e-2,
+    cosine_s: float = 8e-3
+) -> np.ndarray:
+    """Create a beta schedule for the diffusion process.
+
+    Args:
+        schedule: The type of schedule to use. Options are:
+            - 'linear': Linear schedule between sqrt(linear_start) and sqrt(linear_end)
+            - 'cosine': Cosine schedule with scaling parameter cosine_s
+            - 'sqrt_linear': Linear schedule between linear_start and linear_end
+            - 'sqrt': Square root of linear schedule
+        n_timestep: Number of timesteps in the diffusion process
+        linear_start: Starting value for linear schedules
+        linear_end: Ending value for linear schedules
+        cosine_s: Scaling parameter for cosine schedule
+
+    Returns:
+        np.ndarray: Beta values for each timestep
+
+    Raises:
+        ValueError: If schedule type is not recognized
+    """
     if schedule == "linear":
         betas = (
             np.linspace(
@@ -39,14 +62,33 @@ def make_beta_schedule(
 def extract_into_tensor(
     a: torch.Tensor, t: torch.Tensor, x_shape: Tuple[int]
 ) -> torch.Tensor:
+    """Extract values from a tensor at given timesteps and reshape.
+
+    Args:
+        a: Source tensor to extract from
+        t: Timestep indices to extract
+        x_shape: Shape of the target tensor
+
+    Returns:
+        torch.Tensor: Extracted and reshaped values
+    """
     b, *_ = t.shape
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 
-# Copy from: https://github.com/Max-We/sf-zero-signal-to-noise/blob/main/common_diffusion_noise_schedulers_are_flawed.ipynb
-# Original paper: https://arxiv.org/abs/2305.08891
 def enforce_zero_terminal_snr(betas: np.ndarray) -> np.ndarray:
+    """Enforce zero terminal signal-to-noise ratio in the diffusion process.
+
+    Implementation based on:
+    https://arxiv.org/abs/2305.08891
+
+    Args:
+        betas: Original beta schedule
+
+    Returns:
+        np.ndarray: Modified beta schedule with zero terminal SNR
+    """
     betas = torch.from_numpy(betas)
     # Convert betas to alphas_bar_sqrt
     alphas = 1 - betas
@@ -73,6 +115,28 @@ def enforce_zero_terminal_snr(betas: np.ndarray) -> np.ndarray:
 
 
 class Diffusion(nn.Module):
+    """Diffusion model implementation.
+
+    This class implements the core diffusion process, including forward diffusion (q) 
+    and loss computation for reverse diffusion (p).
+
+    Args:
+        timesteps: Number of timesteps in the diffusion process
+        beta_schedule: Schedule for beta values ('linear', 'cosine', 'sqrt_linear', 'sqrt')
+        loss_type: Type of loss function to use ('l1' or 'l2')
+        linear_start: Starting value for linear schedules
+        linear_end: Ending value for linear schedules
+        cosine_s: Scaling parameter for cosine schedule
+        parameterization: Type of model output ('eps', 'x0', or 'v')
+        zero_snr: Whether to enforce zero terminal SNR
+
+    Attributes:
+        num_timesteps (int): Number of diffusion timesteps
+        parameterization (str): Type of model parameterization
+        zero_snr (bool): Whether zero terminal SNR is enforced
+        loss_type (str): Type of loss function
+        betas (np.ndarray): Beta schedule values
+    """
 
     def __init__(
         self,
@@ -119,22 +183,61 @@ class Diffusion(nn.Module):
         self.register("sqrt_one_minus_alphas_cumprod", sqrt_one_minus_alphas_cumprod)
 
     def register(self, name: str, value: np.ndarray) -> None:
+        """Register a buffer with the given name and value.
+
+        Args:
+            name: Name of the buffer
+            value: Value to register as a buffer
+        """
         self.register_buffer(name, torch.tensor(value, dtype=torch.float32))
 
-    def q_sample(self, x_start, t, noise):
+    def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        """Sample from the forward diffusion process q(x_t | x_0).
+
+        Args:
+            x_start: Initial sample (x_0)
+            t: Timesteps to sample at
+            noise: Random noise to add
+
+        Returns:
+            torch.Tensor: Diffused samples at timesteps t
+        """
         return (
             extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
             + extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
             * noise
         )
 
-    def get_v(self, x, noise, t):
+    def get_v(self, x: torch.Tensor, noise: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Compute the velocity prediction target.
+
+        Args:
+            x: Input tensor
+            noise: Random noise
+            t: Timesteps
+
+        Returns:
+            torch.Tensor: Velocity prediction target
+        """
         return (
             extract_into_tensor(self.sqrt_alphas_cumprod, t, x.shape) * noise
             - extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * x
         )
 
-    def get_loss(self, pred, target, mean=True):
+    def get_loss(self, pred: torch.Tensor, target: torch.Tensor, mean: bool = True) -> torch.Tensor:
+        """Compute loss between prediction and target.
+
+        Args:
+            pred: Model predictions
+            target: Target values
+            mean: Whether to return mean loss or per-element loss
+
+        Returns:
+            torch.Tensor: Computed loss values
+
+        Raises:
+            NotImplementedError: If loss_type is not recognized
+        """
         if self.loss_type == "l1":
             loss = (target - pred).abs()
             if mean:
@@ -149,7 +252,18 @@ class Diffusion(nn.Module):
 
         return loss
 
-    def p_losses(self, model, x_start, t, cond):
+    def p_losses(self, model: nn.Module, x_start: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """Compute training losses for the reverse diffusion process.
+
+        Args:
+            model: The model to train
+            x_start: Initial samples
+            t: Timesteps
+            cond: Conditioning information
+
+        Returns:
+            torch.Tensor: Computed loss value
+        """
         noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         model_output = model(x_noisy, t, cond)

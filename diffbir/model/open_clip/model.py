@@ -1,6 +1,42 @@
-""" CLIP Model
+"""CLIP Model for joint vision-language understanding.
 
+This module implements the CLIP (Contrastive Language-Image Pre-training) model architecture.
 Adapted from https://github.com/openai/CLIP. Originally MIT License, Copyright (c) 2021 OpenAI.
+
+The model consists of:
+- A vision transformer for encoding images
+- A text transformer for encoding text
+- A projection layer to align both embeddings in the same space
+- A learned temperature parameter for the contrastive loss
+
+The model can be used to:
+- Extract image features
+- Extract text features 
+- Compare image and text embeddings
+- Zero-shot image classification
+- Text-guided image generation
+
+Classes
+-------
+CLIPVisionCfg
+    Configuration dataclass for the vision transformer.
+    
+CLIPTextCfg
+    Configuration dataclass for the text transformer.
+    
+CLIP
+    Main model class implementing the CLIP architecture.
+
+Functions
+---------
+get_cast_dtype(precision)
+    Get torch dtype based on precision string.
+
+_build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
+    Build the vision transformer component.
+    
+_build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
+    Build the text transformer component.
 """
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -15,6 +51,53 @@ from .transformer import LayerNormFp32, LayerNorm, QuickGELU, VisionTransformer,
 
 @dataclass
 class CLIPVisionCfg:
+    """Configuration for the vision transformer component of CLIP.
+    
+    Parameters
+    ----------
+    layers : Union[Tuple[int, int, int, int], int], default=12
+        Number of transformer layers.
+    width : int, default=768
+        Width of transformer layers.
+    head_width : int, default=64
+        Width of attention heads.
+    mlp_ratio : float, default=4.0
+        Ratio of MLP hidden dim to embedding dim.
+    patch_size : int, default=16
+        Size of image patches.
+    image_size : Union[Tuple[int, int], int], default=224
+        Input image size.
+    ls_init_value : Optional[float], default=None
+        Layer scale initial value.
+    patch_dropout : float, default=0.
+        Dropout rate for patches.
+    input_patchnorm : bool, default=False
+        Whether to use patch normalization.
+    global_average_pool : bool, default=False
+        Whether to use global average pooling.
+    attentional_pool : bool, default=False
+        Whether to use attentional pooling.
+    n_queries : int, default=256
+        Number of queries for attentional pooler.
+    attn_pooler_heads : int, default=8
+        Number of heads for attentional pooling.
+    output_tokens : bool, default=False
+        Whether to output tokens.
+    timm_model_name : str, default=None
+        Name of timm model to use.
+    timm_model_pretrained : bool, default=False
+        Whether to use pretrained timm weights.
+    timm_pool : str, default='avg'
+        Pooling type for timm model.
+    timm_proj : str, default='linear'
+        Projection type for timm model.
+    timm_proj_bias : bool, default=False
+        Whether to use bias in projection.
+    timm_drop : float, default=0.
+        Dropout rate.
+    timm_drop_path : Optional[float], default=None
+        Drop path rate.
+    """
     layers: Union[Tuple[int, int, int, int], int] = 12
     width: int = 768
     head_width: int = 64
@@ -22,32 +105,65 @@ class CLIPVisionCfg:
     patch_size: int = 16
     image_size: Union[Tuple[int, int], int] = 224
 
-    ls_init_value: Optional[float] = None  # layer scale initial value
-    patch_dropout: float = 0.  # what fraction of patches to dropout during training (0 would mean disabled and no patches dropped) - 0.5 to 0.75 recommended in the paper for optimal results
-    input_patchnorm: bool = False  # whether to use dual patchnorm - would only apply the input layernorm on each patch, as post-layernorm already exist in original clip vit design
-    global_average_pool: bool = False  # whether to global average pool the last embedding layer, instead of using CLS token (https://arxiv.org/abs/2205.01580)
-    attentional_pool: bool = False  # whether to use attentional pooler in the last embedding layer
-    n_queries: int = 256  # n_queries for attentional pooler
-    attn_pooler_heads: int = 8  # n heads for attentional_pooling
+    ls_init_value: Optional[float] = None
+    patch_dropout: float = 0.
+    input_patchnorm: bool = False
+    global_average_pool: bool = False
+    attentional_pool: bool = False
+    n_queries: int = 256
+    attn_pooler_heads: int = 8
     output_tokens: bool = False
 
-    timm_model_name: str = None  # a valid model name overrides layers, width, patch_size
-    timm_model_pretrained: bool = False  # use (imagenet) pretrained weights for named model
-    timm_pool: str = 'avg'  # feature pooling for timm model ('abs_attn', 'rot_attn', 'avg', '')
-    timm_proj: str = 'linear'  # linear projection for timm model output ('linear', 'mlp', '')
-    timm_proj_bias: bool = False  # enable bias final projection
-    timm_drop: float = 0.  # head dropout
-    timm_drop_path: Optional[float] = None  # backbone stochastic depth
+    timm_model_name: str = None
+    timm_model_pretrained: bool = False
+    timm_pool: str = 'avg'
+    timm_proj: str = 'linear'
+    timm_proj_bias: bool = False
+    timm_drop: float = 0.
+    timm_drop_path: Optional[float] = None
 
 
 @dataclass
 class CLIPTextCfg:
+    """Configuration for the text transformer component of CLIP.
+    
+    Parameters
+    ----------
+    context_length : int, default=77
+        Maximum sequence length.
+    vocab_size : int, default=49408
+        Size of vocabulary.
+    width : int, default=512
+        Width of transformer layers.
+    heads : int, default=8
+        Number of attention heads.
+    layers : int, default=12
+        Number of transformer layers.
+    ls_init_value : Optional[float], default=None
+        Layer scale initial value.
+    hf_model_name : str, default=None
+        HuggingFace model name.
+    hf_tokenizer_name : str, default=None
+        HuggingFace tokenizer name.
+    hf_model_pretrained : bool, default=True
+        Whether to use pretrained HF model.
+    proj : str, default='mlp'
+        Type of projection layer.
+    pooler_type : str, default='mean_pooler'
+        Type of pooling.
+    embed_cls : bool, default=False
+        Whether to embed CLS token.
+    pad_id : int, default=0
+        Padding token ID.
+    output_tokens : bool, default=False
+        Whether to output tokens.
+    """
     context_length: int = 77
     vocab_size: int = 49408
     width: int = 512
     heads: int = 8
     layers: int = 12
-    ls_init_value: Optional[float] = None  # layer scale initial value
+    ls_init_value: Optional[float] = None
     hf_model_name: str = None
     hf_tokenizer_name: str = None
     hf_model_pretrained: bool = True
@@ -59,6 +175,18 @@ class CLIPTextCfg:
 
 
 def get_cast_dtype(precision: str):
+    """Get torch dtype based on precision string.
+    
+    Parameters
+    ----------
+    precision : str
+        Precision identifier ('bf16' or 'fp16').
+        
+    Returns
+    -------
+    torch.dtype or None
+        Corresponding torch dtype.
+    """
     cast_dtype = None
     if precision == 'bf16':
         cast_dtype = torch.bfloat16
@@ -73,12 +201,27 @@ def _build_vision_tower(
         quick_gelu: bool = False,
         cast_dtype: Optional[torch.dtype] = None
 ):
+    """Build the vision transformer component.
+    
+    Parameters
+    ----------
+    embed_dim : int
+        Dimension of final embedding.
+    vision_cfg : CLIPVisionCfg
+        Vision model configuration.
+    quick_gelu : bool, default=False
+        Whether to use QuickGELU activation.
+    cast_dtype : Optional[torch.dtype], default=None
+        Data type for casting.
+        
+    Returns
+    -------
+    VisionTransformer
+        Vision transformer model.
+    """
     if isinstance(vision_cfg, dict):
         vision_cfg = CLIPVisionCfg(**vision_cfg)
 
-    # OpenAI models are pretrained w/ QuickGELU but native nn.GELU is both faster and more
-    # memory efficient in recent PyTorch releases (>= 1.10).
-    # NOTE: timm models always use native GELU regardless of quick_gelu flag.
     act_layer = QuickGELU if quick_gelu else nn.GELU
 
     vision_heads = vision_cfg.width // vision_cfg.head_width
@@ -112,6 +255,24 @@ def _build_text_tower(
         quick_gelu: bool = False,
         cast_dtype: Optional[torch.dtype] = None,
 ):
+    """Build the text transformer component.
+    
+    Parameters
+    ----------
+    embed_dim : int
+        Dimension of final embedding.
+    text_cfg : CLIPTextCfg
+        Text model configuration.
+    quick_gelu : bool, default=False
+        Whether to use QuickGELU activation.
+    cast_dtype : Optional[torch.dtype], default=None
+        Data type for casting.
+        
+    Returns
+    -------
+    TextTransformer
+        Text transformer model.
+    """
     if isinstance(text_cfg, dict):
         text_cfg = CLIPTextCfg(**text_cfg)
 
@@ -136,6 +297,42 @@ def _build_text_tower(
 
 
 class CLIP(nn.Module):
+    """CLIP (Contrastive Language-Image Pre-training) model.
+    
+    This implements the CLIP model that learns joint representations of images and text.
+    
+    Parameters
+    ----------
+    embed_dim : int
+        Dimension of the joint embedding space.
+    vision_cfg : CLIPVisionCfg
+        Configuration for vision transformer.
+    text_cfg : CLIPTextCfg
+        Configuration for text transformer.
+    quick_gelu : bool, default=False
+        Whether to use QuickGELU activation.
+    cast_dtype : Optional[torch.dtype], default=None
+        Data type for casting operations.
+    output_dict : bool, default=False
+        Whether to return outputs as dictionary.
+        
+    Attributes
+    ----------
+    visual : VisionTransformer
+        Vision encoder.
+    transformer : nn.Module
+        Text encoder transformer.
+    token_embedding : nn.Embedding
+        Text token embeddings.
+    positional_embedding : nn.Parameter
+        Positional embeddings for text.
+    ln_final : LayerNorm
+        Final layer normalization.
+    text_projection : nn.Parameter
+        Text projection matrix.
+    logit_scale : nn.Parameter
+        Learned temperature parameter.
+    """
     output_dict: torch.jit.Final[bool]
 
     def __init__(
@@ -164,19 +361,62 @@ class CLIP(nn.Module):
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
-        # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
+        """Lock the image tower parameters for fine-tuning.
+        
+        Parameters
+        ----------
+        unlocked_groups : int, default=0
+            Number of layer groups to leave unlocked.
+        freeze_bn_stats : bool, default=False
+            Whether to freeze batch norm statistics.
+        """
         self.visual.lock(unlocked_groups=unlocked_groups, freeze_bn_stats=freeze_bn_stats)
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
+        """Enable or disable gradient checkpointing.
+        
+        Parameters
+        ----------
+        enable : bool, default=True
+            Whether to enable gradient checkpointing.
+        """
         self.visual.set_grad_checkpointing(enable)
         self.transformer.grad_checkpointing = enable
 
     def encode_image(self, image, normalize: bool = False):
+        """Encode images into the joint embedding space.
+        
+        Parameters
+        ----------
+        image : torch.Tensor
+            Batch of images.
+        normalize : bool, default=False
+            Whether to normalize the output features.
+            
+        Returns
+        -------
+        torch.Tensor
+            Image features.
+        """
         features = self.visual(image)
         return F.normalize(features, dim=-1) if normalize else features
 
     def encode_text(self, text, normalize: bool = False):
+        """Encode text into the joint embedding space.
+        
+        Parameters
+        ----------
+        text : torch.Tensor
+            Batch of tokenized text.
+        normalize : bool, default=False
+            Whether to normalize the output features.
+            
+        Returns
+        -------
+        torch.Tensor
+            Text features.
+        """
         cast_dtype = self.transformer.get_cast_dtype()
 
         x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
@@ -195,6 +435,20 @@ class CLIP(nn.Module):
             image: Optional[torch.Tensor] = None,
             text: Optional[torch.Tensor] = None,
     ):
+        """Forward pass computing image and text features.
+        
+        Parameters
+        ----------
+        image : Optional[torch.Tensor], default=None
+            Batch of images.
+        text : Optional[torch.Tensor], default=None
+            Batch of tokenized text.
+            
+        Returns
+        -------
+        Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], dict]
+            Image features, text features and logit scale, either as tuple or dict.
+        """
         image_features = self.encode_image(image, normalize=True) if image is not None else None
         text_features = self.encode_text(text, normalize=True) if text is not None else None
         if self.output_dict:

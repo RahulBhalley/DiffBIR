@@ -1,3 +1,20 @@
+"""
+Implementation of SCUNet (Swin-Conv-UNet) for image restoration.
+
+This module implements the SCUNet architecture which combines Swin Transformer blocks
+with convolutional layers in a UNet-like structure. The model is designed for image
+restoration tasks like denoising, super-resolution etc.
+
+The implementation includes several key components:
+- WMSA: Window Multi-head Self Attention module from Swin Transformer
+- Block: Basic Swin Transformer block
+- ConvTransBlock: Combined convolution and transformer block
+- SCUNet: Main model architecture
+
+Reference:
+    "SCUNet: Practical Blind Denoising via Swin-Conv-UNet and Data Synthesis"
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -7,7 +24,23 @@ from timm.models.layers import trunc_normal_, DropPath
 
 
 class WMSA(nn.Module):
-    """ Self-attention module in Swin Transformer
+    """Window Multi-head Self-Attention module from Swin Transformer.
+    
+    This implements the window-based multi-head self-attention mechanism that processes
+    input features in local windows. Supports both regular window attention (W-MSA)
+    and shifted window attention (SW-MSA).
+
+    Args:
+        input_dim (int): Number of input channels
+        output_dim (int): Number of output channels  
+        head_dim (int): Dimension of each attention head
+        window_size (int): Size of attention window
+        type (str): Attention type - 'W' for regular window or 'SW' for shifted window
+
+    Attributes:
+        scale (float): Scaling factor for attention scores
+        n_heads (int): Number of attention heads
+        relative_position_params (nn.Parameter): Learnable relative position embeddings
     """
 
     def __init__(self, input_dim, output_dim, head_dim, window_size, type):
@@ -31,11 +64,16 @@ class WMSA(nn.Module):
         self.relative_position_params = torch.nn.Parameter(self.relative_position_params.view(2*window_size-1, 2*window_size-1, self.n_heads).transpose(1,2).transpose(0,1))
 
     def generate_mask(self, h, w, p, shift):
-        """ generating the mask of SW-MSA
+        """Generate attention mask for SW-MSA.
+        
         Args:
-            shift: shift parameters in CyclicShift.
+            h (int): Height in windows
+            w (int): Width in windows  
+            p (int): Window size
+            shift (int): Shift size for SW-MSA
+
         Returns:
-            attn_mask: should be (1 1 w p p),
+            torch.Tensor: Attention mask tensor
         """
         # supporting sqaure.
         attn_mask = torch.zeros(h, w, p, p, p, p, dtype=torch.bool, device=self.relative_position_params.device)
@@ -51,12 +89,13 @@ class WMSA(nn.Module):
         return attn_mask
 
     def forward(self, x):
-        """ Forward pass of Window Multi-head Self-attention module.
+        """Forward pass of the window attention module.
+
         Args:
-            x: input tensor with shape of [b h w c];
-            attn_mask: attention mask, fill -inf where the value is True; 
+            x (torch.Tensor): Input tensor of shape [B, H, W, C]
+
         Returns:
-            output: tensor shape [b h w c]
+            torch.Tensor: Output tensor of shape [B, H, W, C]
         """
         if self.type!='W': x = torch.roll(x, shifts=(-(self.window_size//2), -(self.window_size//2)), dims=(1,2))
         x = rearrange(x, 'b (w1 p1) (w2 p2) c -> b w1 w2 p1 p2 c', p1=self.window_size, p2=self.window_size)
@@ -86,6 +125,11 @@ class WMSA(nn.Module):
         return output
 
     def relative_embedding(self):
+        """Compute relative positional embeddings.
+
+        Returns:
+            torch.Tensor: Relative position embedding matrix
+        """
         cord = torch.tensor(np.array([[i, j] for i in range(self.window_size) for j in range(self.window_size)]))
         relation = cord[:, None, :] - cord[None, :, :] + self.window_size -1
         # negative is allowed
@@ -93,9 +137,22 @@ class WMSA(nn.Module):
 
 
 class Block(nn.Module):
+    """Swin Transformer block.
+    
+    Basic building block of Swin Transformer containing window attention
+    and MLP modules.
+
+    Args:
+        input_dim (int): Input channel dimension
+        output_dim (int): Output channel dimension
+        head_dim (int): Dimension of attention heads
+        window_size (int): Size of attention window
+        drop_path (float): Drop path rate
+        type (str): Attention type - 'W' or 'SW'
+        input_resolution (int, optional): Input resolution
+    """
+
     def __init__(self, input_dim, output_dim, head_dim, window_size, drop_path, type='W', input_resolution=None):
-        """ SwinTransformer Block
-        """
         super(Block, self).__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -116,15 +173,36 @@ class Block(nn.Module):
         )
 
     def forward(self, x):
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Output tensor
+        """
         x = x + self.drop_path(self.msa(self.ln1(x)))
         x = x + self.drop_path(self.mlp(self.ln2(x)))
         return x
 
 
 class ConvTransBlock(nn.Module):
+    """Combined Convolution and Transformer block.
+    
+    This block combines convolution layers with Swin Transformer blocks
+    for hybrid feature processing.
+
+    Args:
+        conv_dim (int): Dimension of convolution branch
+        trans_dim (int): Dimension of transformer branch
+        head_dim (int): Dimension of attention heads
+        window_size (int): Size of attention window
+        drop_path (float): Drop path rate
+        type (str): Attention type - 'W' or 'SW'
+        input_resolution (int, optional): Input resolution
+    """
+
     def __init__(self, conv_dim, trans_dim, head_dim, window_size, drop_path, type='W', input_resolution=None):
-        """ SwinTransformer and Conv Block
-        """
         super(ConvTransBlock, self).__init__()
         self.conv_dim = conv_dim
         self.trans_dim = trans_dim
@@ -149,6 +227,14 @@ class ConvTransBlock(nn.Module):
                 )
 
     def forward(self, x):
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Output tensor
+        """
         conv_x, trans_x = torch.split(self.conv1_1(x), (self.conv_dim, self.trans_dim), dim=1)
         conv_x = self.conv_block(conv_x) + conv_x
         trans_x = Rearrange('b c h w -> b h w c')(trans_x)
@@ -161,6 +247,18 @@ class ConvTransBlock(nn.Module):
 
 
 class SCUNet(nn.Module):
+    """Swin-Conv UNet architecture.
+    
+    A hybrid CNN-Transformer architecture combining Swin Transformer blocks with
+    convolutional layers in a UNet-like structure for image restoration.
+
+    Args:
+        in_nc (int, optional): Number of input channels. Defaults to 3.
+        config (list, optional): Configuration of blocks at each stage. Defaults to [2,2,2,2,2,2,2].
+        dim (int, optional): Base channel dimension. Defaults to 64.
+        drop_path_rate (float, optional): Drop path rate. Defaults to 0.0.
+        input_resolution (int, optional): Input image resolution. Defaults to 256.
+    """
 
     def __init__(self, in_nc=3, config=[2,2,2,2,2,2,2], dim=64, drop_path_rate=0.0, input_resolution=256):
         super(SCUNet, self).__init__()
@@ -222,7 +320,14 @@ class SCUNet(nn.Module):
         #self.apply(self._init_weights)
 
     def forward(self, x0):
+        """Forward pass.
 
+        Args:
+            x0 (torch.Tensor): Input image tensor of shape [B, C, H, W]
+
+        Returns:
+            torch.Tensor: Output image tensor of shape [B, C, H, W]
+        """
         h, w = x0.size()[-2:]
         paddingBottom = int(np.ceil(h/64)*64-h)
         paddingRight = int(np.ceil(w/64)*64-w)
@@ -244,6 +349,11 @@ class SCUNet(nn.Module):
 
 
     def _init_weights(self, m):
+        """Initialize model weights.
+
+        Args:
+            m (nn.Module): Module to initialize
+        """
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
             if m.bias is not None:

@@ -1,3 +1,10 @@
+"""
+Transformer modules and utilities for OpenCLIP model.
+
+This module contains various transformer components including layer normalization,
+attention mechanisms, and other building blocks used in the OpenCLIP architecture.
+"""
+
 import collections
 from collections import OrderedDict
 import math
@@ -9,8 +16,16 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-# From PyTorch internals
 def _ntuple(n):
+    """
+    Creates a function that converts a single value or iterable into an n-tuple.
+    
+    Args:
+        n (int): The length of the target tuple
+        
+    Returns:
+        callable: A function that converts input into an n-tuple
+    """
     def parse(x):
         if isinstance(x, collections.abc.Iterable):
             return x
@@ -21,7 +36,12 @@ to_2tuple = _ntuple(2)
 
 
 class LayerNormFp32(nn.LayerNorm):
-    """Subclass torch's LayerNorm to handle fp16 (by casting to float32 and back)."""
+    """
+    Layer normalization module that casts input to float32 for better numerical stability.
+    
+    Inherits from torch.nn.LayerNorm but performs computation in float32 precision
+    regardless of input dtype.
+    """
 
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
@@ -30,7 +50,11 @@ class LayerNormFp32(nn.LayerNorm):
 
 
 class LayerNorm(nn.LayerNorm):
-    """Subclass torch's LayerNorm (with cast back to input dtype)."""
+    """
+    Layer normalization that preserves input dtype.
+    
+    Similar to standard LayerNorm but ensures output dtype matches input dtype.
+    """
 
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
@@ -39,12 +63,27 @@ class LayerNorm(nn.LayerNorm):
 
 
 class QuickGELU(nn.Module):
-    # NOTE This is slower than nn.GELU or nn.SiLU and uses more GPU memory
+    """
+    Fast approximate version of GELU activation function.
+    
+    Uses sigmoid approximation instead of error function.
+    Note: This implementation is slower than nn.GELU and uses more GPU memory.
+    """
+    
     def forward(self, x: torch.Tensor):
         return x * torch.sigmoid(1.702 * x)
 
 
 class LayerScale(nn.Module):
+    """
+    Learnable scaling for network layers.
+    
+    Args:
+        dim (int): Number of input channels
+        init_values (float, optional): Initial value for scaling. Defaults to 1e-5
+        inplace (bool, optional): Whether to perform scaling in-place. Defaults to False
+    """
+    
     def __init__(self, dim, init_values=1e-5, inplace=False):
         super().__init__()
         self.inplace = inplace
@@ -56,14 +95,20 @@ class LayerScale(nn.Module):
 
 class PatchDropout(nn.Module):
     """
-    https://arxiv.org/abs/2212.00794
+    Randomly drops patches from input sequences during training.
+    
+    Implementation based on https://arxiv.org/abs/2212.00794
+    
+    Args:
+        prob (float): Probability of dropping each patch
+        exclude_first_token (bool, optional): Whether to exclude CLS token from dropout. Defaults to True
     """
 
     def __init__(self, prob, exclude_first_token=True):
         super().__init__()
         assert 0 <= prob < 1.
         self.prob = prob
-        self.exclude_first_token = exclude_first_token  # exclude CLS token
+        self.exclude_first_token = exclude_first_token
 
     def forward(self, x):
         if not self.training or self.prob == 0.:
@@ -95,6 +140,20 @@ class PatchDropout(nn.Module):
 
 
 class Attention(nn.Module):
+    """
+    Multi-head attention module with optional scaled cosine attention.
+    
+    Args:
+        dim (int): Total dimension of the model
+        num_heads (int, optional): Number of attention heads. Defaults to 8
+        qkv_bias (bool, optional): If True, adds bias to query, key, value projections. Defaults to True
+        scaled_cosine (bool, optional): If True, uses scaled cosine attention. Defaults to False
+        scale_heads (bool, optional): If True, adds learnable scaling per head. Defaults to False
+        logit_scale_max (float, optional): Maximum logit scale for scaled cosine attention. Defaults to log(1/0.01)
+        attn_drop (float, optional): Dropout rate for attention weights. Defaults to 0.0
+        proj_drop (float, optional): Dropout rate for projection outputs. Defaults to 0.0
+    """
+
     def __init__(
             self,
             dim,
@@ -115,7 +174,6 @@ class Attention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.logit_scale_max = logit_scale_max
 
-        # keeping in_proj in this form (instead of nn.Linear) to match weight scheme of original
         self.in_proj_weight = nn.Parameter(torch.randn((dim * 3, dim)) * self.scale)
         if qkv_bias:
             self.in_proj_bias = nn.Parameter(torch.zeros(dim * 3))
@@ -171,6 +229,17 @@ class Attention(nn.Module):
 
 
 class AttentionalPooler(nn.Module):
+    """
+    Learnable attention pooling layer.
+    
+    Args:
+        d_model (int): Model dimension for queries
+        context_dim (int): Dimension of context (keys/values)
+        n_head (int, optional): Number of attention heads. Defaults to 8
+        n_queries (int, optional): Number of learnable queries. Defaults to 256
+        norm_layer (callable, optional): Normalization layer. Defaults to LayerNorm
+    """
+
     def __init__(
             self,
             d_model: int,
@@ -197,6 +266,49 @@ class AttentionalPooler(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
+    """Residual attention block with optional cross-attention.
+
+    This module implements a residual attention block that can be used for both self-attention
+    and cross-attention. It consists of:
+    1. Layer normalization + multi-head attention
+    2. Layer normalization + MLP
+    Both branches have residual connections and optional layer scaling.
+
+    Parameters
+    ----------
+    d_model : int
+        Dimension of the model (embedding dimension)
+    n_head : int 
+        Number of attention heads
+    mlp_ratio : float, optional
+        Ratio of MLP hidden dimension to embedding dimension, by default 4.0
+    ls_init_value : float, optional
+        Initial value for layer scale. If None, layer scale is disabled
+    act_layer : callable, optional
+        Activation layer constructor, by default nn.GELU
+    norm_layer : callable, optional
+        Normalization layer constructor, by default LayerNorm
+    is_cross_attention : bool, optional
+        Whether to use cross-attention, by default False
+
+    Attributes
+    ----------
+    ln_1 : nn.Module
+        First layer normalization
+    attn : nn.MultiheadAttention
+        Multi-head attention module
+    ls_1 : nn.Module
+        First layer scale or identity
+    ln_1_kv : nn.Module, optional
+        Layer norm for key/value in cross-attention
+    ln_2 : nn.Module
+        Second layer normalization
+    mlp : nn.Sequential
+        MLP block with activation
+    ls_2 : nn.Module
+        Second layer scale or identity
+    """
+
     def __init__(
             self,
             d_model: int,
@@ -230,7 +342,25 @@ class ResidualAttentionBlock(nn.Module):
             k_x: Optional[torch.Tensor] = None,
             v_x: Optional[torch.Tensor] = None,
             attn_mask: Optional[torch.Tensor] = None,
-    ):
+    ) -> torch.Tensor:
+        """Apply attention mechanism.
+
+        Parameters
+        ----------
+        q_x : torch.Tensor
+            Query tensor
+        k_x : torch.Tensor, optional
+            Key tensor, defaults to query if None
+        v_x : torch.Tensor, optional
+            Value tensor, defaults to query if None
+        attn_mask : torch.Tensor, optional
+            Attention mask tensor
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor after attention
+        """
         k_x = k_x if k_x is not None else q_x
         v_x = v_x if v_x is not None else q_x
 
@@ -245,7 +375,25 @@ class ResidualAttentionBlock(nn.Module):
             k_x: Optional[torch.Tensor] = None,
             v_x: Optional[torch.Tensor] = None,
             attn_mask: Optional[torch.Tensor] = None,
-    ):
+    ) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        q_x : torch.Tensor
+            Query tensor
+        k_x : torch.Tensor, optional
+            Key tensor for cross-attention
+        v_x : torch.Tensor, optional
+            Value tensor for cross-attention
+        attn_mask : torch.Tensor, optional
+            Attention mask tensor
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor after residual attention block
+        """
         k_x = self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
         v_x = self.ln_1_kv(v_x) if hasattr(self, "ln_1_kv") and v_x is not None else None
 
@@ -255,6 +403,39 @@ class ResidualAttentionBlock(nn.Module):
 
 
 class CustomResidualAttentionBlock(nn.Module):
+    """Custom residual attention block with additional features.
+
+    This module extends the base ResidualAttentionBlock with additional scaling options
+    and normalization layers. It supports:
+    - Cosine attention scaling
+    - Head scaling
+    - Attention scaling
+    - FC layer scaling
+
+    Parameters
+    ----------
+    d_model : int
+        Dimension of the model
+    n_head : int
+        Number of attention heads
+    mlp_ratio : float, optional
+        MLP hidden dimension ratio, by default 4.0
+    ls_init_value : float, optional
+        Layer scale initial value, by default None
+    act_layer : callable, optional
+        Activation layer constructor, by default nn.GELU
+    norm_layer : callable, optional
+        Normalization layer constructor, by default LayerNorm
+    scale_cosine_attn : bool, optional
+        Whether to scale cosine attention, by default False
+    scale_heads : bool, optional
+        Whether to scale attention heads, by default False
+    scale_attn : bool, optional
+        Whether to add normalization after attention, by default False
+    scale_fc : bool, optional
+        Whether to add normalization in MLP, by default False
+    """
+
     def __init__(
             self,
             d_model: int,
@@ -289,13 +470,60 @@ class CustomResidualAttentionBlock(nn.Module):
         ]))
         self.ls_2 = LayerScale(d_model, ls_init_value) if ls_init_value is not None else nn.Identity()
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor
+        attn_mask : torch.Tensor, optional
+            Attention mask tensor
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor after custom residual attention block
+        """
         x = x + self.ls_1(self.ln_attn(self.attn(self.ln_1(x), attn_mask=attn_mask)))
         x = x + self.ls_2(self.mlp(self.ln_2(x)))
         return x
 
 
 class Transformer(nn.Module):
+    """Transformer encoder stack.
+
+    A stack of transformer encoder layers with support for gradient checkpointing.
+
+    Parameters
+    ----------
+    width : int
+        Model dimension
+    layers : int
+        Number of transformer layers
+    heads : int
+        Number of attention heads
+    mlp_ratio : float, optional
+        MLP hidden dimension ratio, by default 4.0
+    ls_init_value : float, optional
+        Layer scale initial value, by default None
+    act_layer : callable, optional
+        Activation layer constructor, by default nn.GELU
+    norm_layer : callable, optional
+        Normalization layer constructor, by default LayerNorm
+
+    Attributes
+    ----------
+    width : int
+        Model dimension
+    layers : int
+        Number of layers
+    grad_checkpointing : bool
+        Whether gradient checkpointing is enabled
+    resblocks : nn.ModuleList
+        List of transformer encoder layers
+    """
+
     def __init__(
             self,
             width: int,
@@ -318,11 +546,32 @@ class Transformer(nn.Module):
         ])
 
     def get_cast_dtype(self) -> torch.dtype:
+        """Get the dtype used for casting.
+
+        Returns
+        -------
+        torch.dtype
+            Dtype used for casting weights
+        """
         if hasattr(self.resblocks[0].mlp.c_fc, 'int8_original_dtype'):
             return self.resblocks[0].mlp.c_fc.int8_original_dtype
         return self.resblocks[0].mlp.c_fc.weight.dtype
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor
+        attn_mask : torch.Tensor, optional
+            Attention mask tensor
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor after transformer encoder stack
+        """
         for r in self.resblocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
                 # TODO: handle kwargs https://github.com/pytorch/pytorch/issues/79887#issuecomment-1161758372
@@ -333,6 +582,61 @@ class Transformer(nn.Module):
 
 
 class VisionTransformer(nn.Module):
+    """Vision Transformer (ViT) for image encoding.
+
+    A PyTorch implementation of the Vision Transformer model that processes images through 
+    patch embedding, positional encoding, and transformer layers to produce image features.
+
+    Parameters
+    ----------
+    image_size : int
+        Size of input image (assumed square). For rectangular images, will be converted to (image_size, image_size)
+    patch_size : int 
+        Size of patches to divide image into. Determines the sequence length
+    width : int
+        Dimension of transformer embeddings
+    layers : int
+        Number of transformer layers
+    heads : int
+        Number of attention heads per transformer layer
+    mlp_ratio : float
+        Ratio of mlp hidden dim to embedding dim
+    ls_init_value : float, optional
+        Layer scale initial value. If None, layer scaling is disabled
+    global_average_pool : bool, default=False
+        If True, average pool all tokens, otherwise use [CLS] token
+    attentional_pool : bool, default=False
+        If True, use attention pooling instead of [CLS] token or average pooling
+    n_queries : int, default=256
+        Number of learnable queries for attention pooling
+    attn_pooler_heads : int, default=8
+        Number of heads in attention pooler
+    output_dim : int, default=512
+        Dimension of output features
+    patch_dropout : float, default=0.
+        Probability of dropping patches during training
+    input_patchnorm : bool, default=False
+        If True, normalize patch embeddings
+    act_layer : callable, default=nn.GELU
+        Activation layer constructor
+    norm_layer : callable, default=LayerNorm 
+        Normalization layer constructor
+    output_tokens : bool, default=False
+        If True, return intermediate tokens in addition to pooled output
+
+    Attributes
+    ----------
+    output_tokens : bool
+        Whether to output intermediate tokens
+    image_size : tuple
+        Height and width of input image
+    patch_size : tuple
+        Height and width of each patch
+    grid_size : tuple
+        Number of patches in height and width dimensions
+    output_dim : int
+        Dimension of output features
+    """
     output_tokens: torch.jit.Final[bool]
 
     def __init__(
@@ -405,6 +709,15 @@ class VisionTransformer(nn.Module):
         self.init_parameters()
 
     def lock(self, unlocked_groups=0, freeze_bn_stats=False):
+        """Lock (freeze) all model weights except for the final unlocked_groups.
+        
+        Parameters
+        ----------
+        unlocked_groups : int, default=0
+            Number of groups from the end to leave unlocked
+        freeze_bn_stats : bool, default=False
+            If True, freeze batch norm statistics
+        """
         for param in self.parameters():
             param.requires_grad = False
 
@@ -438,6 +751,10 @@ class VisionTransformer(nn.Module):
             _unlock(groups[-unlocked_groups:])
 
     def init_parameters(self):
+        """Initialize model parameters.
+        
+        Currently a no-op, but kept for future initialization schemes.
+        """
         # FIXME OpenAI CLIP did not define an init for the VisualTransformer
         # TODO experiment if default PyTorch init, below, or alternate init is best.
 
@@ -459,16 +776,47 @@ class VisionTransformer(nn.Module):
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
+        """Enable or disable gradient checkpointing.
+
+        Parameters
+        ----------
+        enable : bool, default=True
+            If True, enables gradient checkpointing
+        """
         self.transformer.grad_checkpointing = enable
 
     def _global_pool(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pool features globally.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input features of shape (batch_size, sequence_length, hidden_dim)
+
+        Returns
+        -------
+        tuple
+            Pooled features and remaining tokens
+        """
         if self.global_average_pool:
             return x.mean(dim=1), x
         else:
             return x[:, 0], x[:, 1:]
 
     def forward(self, x: torch.Tensor):
+        """Forward pass of the model.
 
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input image tensor of shape (batch_size, channels, height, width)
+
+        Returns
+        -------
+        torch.Tensor or tuple
+            If output_tokens is False, returns pooled features of shape (batch_size, output_dim)
+            If output_tokens is True, returns tuple of pooled features and intermediate tokens
+        """
         # to patches - whether to use dual patchnorm - https://arxiv.org/abs/2302.01327v1
         if self.input_patchnorm:
             # einops - rearrange(x, 'b c (h p1) (w p2) -> b (h w) (c p1 p2)')
@@ -514,6 +862,70 @@ class VisionTransformer(nn.Module):
 
 
 class TextTransformer(nn.Module):
+    """Text transformer encoder for CLIP model.
+
+    This module implements a transformer encoder for processing text sequences. It includes token 
+    and positional embeddings, multiple transformer layers, and optional CLS token handling.
+
+    Parameters
+    ----------
+    context_length : int, default=77
+        Maximum sequence length for input text
+    vocab_size : int, default=49408
+        Size of token vocabulary
+    width : int, default=512
+        Dimension of transformer embeddings
+    heads : int, default=8
+        Number of attention heads per transformer layer
+    layers : int, default=12
+        Number of transformer layers
+    ls_init_value : float, optional
+        Layer scale initial value. If None, layer scaling is disabled
+    output_dim : int, default=512
+        Dimension of output features
+    act_layer : callable, default=nn.GELU
+        Activation layer constructor
+    norm_layer : callable, default=LayerNorm
+        Normalization layer constructor
+    embed_cls : bool, default=False
+        If True, add learnable CLS token embedding
+    pad_id : int, default=0
+        Token ID used for padding
+    output_tokens : bool, default=False
+        If True, return intermediate tokens in addition to pooled output
+
+    Attributes
+    ----------
+    output_tokens : bool
+        Whether to output intermediate tokens
+    context_length : int
+        Maximum sequence length
+    vocab_size : int
+        Size of token vocabulary
+    width : int
+        Dimension of transformer embeddings
+    output_dim : int
+        Dimension of output features
+    heads : int
+        Number of attention heads
+    pad_id : int
+        Padding token ID
+    text_projection : nn.Parameter
+        Projection matrix for final output
+    cls_emb : nn.Parameter or None
+        CLS token embedding if embed_cls=True
+    token_embedding : nn.Embedding
+        Token embedding layer
+    positional_embedding : nn.Parameter
+        Positional embedding weights
+    transformer : Transformer
+        Main transformer encoder
+    ln_final : nn.Module
+        Final layer normalization
+    attn_mask : torch.Tensor
+        Causal attention mask
+    """
+
     output_tokens: torch.jit.Final[bool]
 
     def __init__(
@@ -565,6 +977,11 @@ class TextTransformer(nn.Module):
         self.init_parameters()
 
     def init_parameters(self):
+        """Initialize model parameters.
+
+        Initializes embeddings and transformer weights using normal distributions with 
+        carefully chosen standard deviations based on model dimensions.
+        """
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         nn.init.normal_(self.positional_embedding, std=0.01)
         if self.cls_emb is not None:
@@ -584,17 +1001,43 @@ class TextTransformer(nn.Module):
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
+        """Enable or disable gradient checkpointing.
+
+        Parameters
+        ----------
+        enable : bool, default=True
+            If True, enables gradient checkpointing for memory efficiency
+        """
         self.transformer.grad_checkpointing = enable
 
     def build_attention_mask(self):
-        # lazily create causal attention mask, with full attention between the tokens
-        # pytorch uses additive attention mask; fill with -inf
+        """Build causal attention mask.
+
+        Returns
+        -------
+        torch.Tensor
+            Causal attention mask of shape (num_pos, num_pos) with -inf in upper triangle
+        """
         mask = torch.empty(self.num_pos, self.num_pos)
         mask.fill_(float("-inf"))
         mask.triu_(1)  # zero out the lower diagonal
         return mask
 
     def build_cls_mask(self, text, cast_dtype: torch.dtype):
+        """Build attention mask for CLS token.
+
+        Parameters
+        ----------
+        text : torch.Tensor
+            Input text tensor
+        cast_dtype : torch.dtype
+            Data type for mask tensor
+
+        Returns
+        -------
+        torch.Tensor
+            Attention mask for CLS token
+        """
         cls_mask = (text != self.pad_id).unsqueeze(1)
         cls_mask = F.pad(cls_mask, (1, 0, cls_mask.shape[2], 0), value=1.0)
         additive_mask = torch.empty(cls_mask.shape, dtype=cast_dtype, device=cls_mask.device)
@@ -604,9 +1047,36 @@ class TextTransformer(nn.Module):
         return additive_mask
 
     def _repeat(self, t, N: int):
+        """Repeat tensor along batch dimension.
+
+        Parameters
+        ----------
+        t : torch.Tensor
+            Input tensor
+        N : int
+            Number of repeats
+
+        Returns
+        -------
+        torch.Tensor
+            Repeated tensor
+        """
         return t.reshape(1, 1, -1).repeat(N, 1, 1)
 
     def forward(self, text):
+        """Forward pass through text transformer.
+
+        Parameters
+        ----------
+        text : torch.Tensor
+            Input text tokens of shape (batch_size, seq_len)
+
+        Returns
+        -------
+        torch.Tensor or tuple
+            If output_tokens is False, returns pooled features of shape (batch_size, output_dim)
+            If output_tokens is True, returns tuple of pooled features and intermediate tokens
+        """
         cast_dtype = self.transformer.get_cast_dtype()
         seq_len = text.shape[1]
 
@@ -642,6 +1112,34 @@ class TextTransformer(nn.Module):
 
 
 class MultimodalTransformer(Transformer):
+    """A transformer model that processes both text and image inputs through cross-attention.
+    
+    This transformer extends the base Transformer class by adding cross-attention layers
+    that allow text features to attend to image features. It processes text embeddings
+    through self-attention blocks followed by cross-attention with image embeddings.
+
+    Parameters
+    ----------
+    width : int
+        Hidden dimension size/width of the transformer.
+    layers : int 
+        Number of transformer layers.
+    heads : int
+        Number of attention heads.
+    context_length : int, optional
+        Maximum sequence length for text inputs, by default 77.
+    mlp_ratio : float, optional
+        Ratio of MLP hidden dimension to transformer width, by default 4.0.
+    ls_init_value : float, optional
+        Layer scale initial value. If None, layer scaling is disabled.
+    act_layer : callable, optional
+        Activation layer constructor, by default nn.GELU.
+    norm_layer : callable, optional
+        Normalization layer constructor, by default LayerNorm.
+    output_dim : int, optional
+        Output projection dimension, by default 512.
+    """
+
     def __init__(
             self,
             width: int,
@@ -654,7 +1152,6 @@ class MultimodalTransformer(Transformer):
             norm_layer: Callable = LayerNorm,
             output_dim: int = 512,
     ):
-
         super().__init__(
             width=width,
             layers=layers,
@@ -684,6 +1181,12 @@ class MultimodalTransformer(Transformer):
         self.text_projection = nn.Parameter(torch.empty(width, output_dim))
 
     def init_parameters(self):
+        """Initialize transformer parameters.
+
+        Initializes the weights of self-attention, cross-attention, and MLP layers
+        using normal distributions with carefully chosen standard deviations based
+        on the transformer's width and number of layers.
+        """
         proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
         attn_std = self.transformer.width ** -0.5
         fc_std = (2 * self.transformer.width) ** -0.5
@@ -702,14 +1205,40 @@ class MultimodalTransformer(Transformer):
             nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
     def build_attention_mask(self):
-        # lazily create causal attention mask, with full attention between the tokens
-        # pytorch uses additive attention mask; fill with -inf
+        """Build causal attention mask.
+
+        Creates a causal (triangular) attention mask that prevents tokens from
+        attending to future tokens in the sequence.
+
+        Returns
+        -------
+        torch.Tensor
+            Attention mask of shape (context_length, context_length) filled with
+            -inf in the upper triangle.
+        """
         mask = torch.empty(self.context_length, self.context_length)
         mask.fill_(float("-inf"))
         mask.triu_(1)  # zero out the lower diagonal
         return mask
 
     def forward(self, image_embs, text_embs):
+        """Forward pass through the multimodal transformer.
+
+        Processes text embeddings through alternating self-attention and
+        cross-attention with image embeddings.
+
+        Parameters
+        ----------
+        image_embs : torch.Tensor
+            Image embeddings of shape (batch_size, seq_len, width)
+        text_embs : torch.Tensor
+            Text embeddings of shape (batch_size, seq_len, width)
+
+        Returns
+        -------
+        torch.Tensor
+            Processed text embeddings of shape (batch_size, seq_len, output_dim)
+        """
         text_embs = text_embs.permute(1, 0, 2)  # NLD -> LNDsq
         image_embs = image_embs.permute(1, 0, 2)  # NLD -> LND
         seq_len = text_embs.shape[0]
@@ -733,4 +1262,12 @@ class MultimodalTransformer(Transformer):
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
+        """Enable or disable gradient checkpointing.
+
+        Parameters
+        ----------
+        enable : bool, optional
+            If True, enables gradient checkpointing for memory efficiency,
+            by default True
+        """
         self.grad_checkpointing = enable

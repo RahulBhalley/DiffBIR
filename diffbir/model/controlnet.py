@@ -1,3 +1,13 @@
+"""
+Implementation of ControlNet and ControlledUnetModel for controlled image generation.
+
+This module contains the core components of the ControlNet architecture, which enables
+controlled image generation by conditioning a UNet model with additional image hints.
+
+The implementation is based on the paper:
+"Adding Conditional Control to Text-to-Image Diffusion Models"
+"""
+
 import torch
 import torch as th
 import torch.nn as nn
@@ -14,16 +24,36 @@ from .unet import (
 
 
 class ControlledUnetModel(UNetModel):
+    """A UNet model that can be controlled by additional conditioning signals.
+    
+    This model extends the base UNet by allowing injection of control signals
+    at multiple resolutions during the generation process.
+
+    Inherits from UNetModel and overrides the forward pass to handle control signals.
+    """
 
     def forward(
         self,
-        x,
-        timesteps=None,
-        context=None,
-        control=None,
-        only_mid_control=False,
+        x: torch.Tensor,
+        timesteps: torch.Tensor = None,
+        context: torch.Tensor = None,
+        control: list = None,
+        only_mid_control: bool = False,
         **kwargs,
-    ):
+    ) -> torch.Tensor:
+        """Forward pass of the controlled UNet model.
+
+        Args:
+            x: Input tensor of shape [B, C, H, W]
+            timesteps: Timestep embeddings of shape [B]
+            context: Context embeddings for conditioning
+            control: List of control signals at different resolutions
+            only_mid_control: If True, only apply control in middle block
+            **kwargs: Additional arguments passed to parent class
+
+        Returns:
+            torch.Tensor: Generated output of same shape as input
+        """
         hs = []
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
@@ -48,6 +78,40 @@ class ControlledUnetModel(UNetModel):
 
 
 class ControlNet(nn.Module):
+    """ControlNet model for generating control signals.
+
+    This model processes input images and hints to generate control signals
+    that can guide the generation process of a controlled UNet model.
+
+    Args:
+        image_size: Size of input images
+        in_channels: Number of input channels
+        model_channels: Base channel count for the model
+        hint_channels: Number of hint channels
+        num_res_blocks: Number of residual blocks per downsample
+        attention_resolutions: At which resolutions to apply attention
+        dropout: Dropout probability
+        channel_mult: Channel multiplier for each level
+        conv_resample: If True, use learned conv for up/downsampling
+        dims: Dimensionality of the model (2 for images)
+        use_checkpoint: If True, use gradient checkpointing
+        use_fp16: If True, use FP16 precision
+        num_heads: Number of attention heads (-1 for default)
+        num_head_channels: Number of channels per attention head (-1 for default)
+        num_heads_upsample: Number of attention heads for upsampling (-1 for default)
+        use_scale_shift_norm: If True, use scale-shift normalization
+        resblock_updown: If True, use residual blocks for up/downsampling
+        use_new_attention_order: If True, use alternate attention order
+        use_spatial_transformer: If True, use spatial transformer attention
+        transformer_depth: Depth of the transformer layers
+        context_dim: Dimension of the context embeddings
+        n_embed: Size of the codebook for VQ models
+        legacy: If True, use legacy attention behavior
+        disable_self_attentions: List of bools to disable self-attention per level
+        num_attention_blocks: Number of attention blocks per level
+        disable_middle_self_attn: If True, disable middle block self-attention
+        use_linear_in_transformer: If True, use linear layers in transformer
+    """
 
     def __init__(
         self,
@@ -307,11 +371,31 @@ class ControlNet(nn.Module):
         self._feature_size += ch
 
     def make_zero_conv(self, channels):
+        """Creates a zero-initialized convolutional layer.
+
+        Args:
+            channels: Number of input/output channels
+
+        Returns:
+            TimestepEmbedSequential: Zero-initialized conv layer wrapped in sequential
+        """
         return TimestepEmbedSequential(
             zero_module(conv_nd(self.dims, channels, channels, 1, padding=0))
         )
 
     def forward(self, x, hint, timesteps, context, **kwargs):
+        """Forward pass of the ControlNet model.
+
+        Args:
+            x: Input tensor of shape [B, C, H, W]
+            hint: Conditioning hint tensor
+            timesteps: Timestep embeddings
+            context: Context embeddings
+            **kwargs: Additional arguments
+
+        Returns:
+            list: List of control signals at different resolutions
+        """
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
         x = torch.cat((x, hint), dim=1)

@@ -1,3 +1,16 @@
+"""
+This module implements a Variational Autoencoder (VAE) architecture with KL divergence regularization.
+
+The VAE consists of several key components:
+- Encoder: Compresses input images into a latent representation
+- Decoder: Reconstructs images from the latent space
+- Various attention mechanisms for improved feature extraction
+- Utility layers like ResNet blocks, up/downsampling, and normalization
+
+The architecture is based on the paper "Autoencoding beyond pixels using a learned similarity metric"
+(https://arxiv.org/abs/1512.09300)
+"""
+
 import math
 import torch
 import torch.nn as nn
@@ -10,19 +23,41 @@ from .distributions import DiagonalGaussianDistribution
 from .config import Config, AttnMode
 
 
-def nonlinearity(x):
-    # swish
+def nonlinearity(x: torch.Tensor) -> torch.Tensor:
+    """Applies the Swish/SiLU activation function.
+    
+    Args:
+        x: Input tensor
+        
+    Returns:
+        Tensor with Swish activation applied
+    """
     return x * torch.sigmoid(x)
 
 
-def Normalize(in_channels, num_groups=32):
+def Normalize(in_channels: int, num_groups: int = 32) -> nn.Module:
+    """Creates a GroupNorm normalization layer.
+    
+    Args:
+        in_channels: Number of input channels
+        num_groups: Number of groups to separate the channels into
+        
+    Returns:
+        GroupNorm module
+    """
     return torch.nn.GroupNorm(
         num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True
     )
 
 
 class Upsample(nn.Module):
-    def __init__(self, in_channels, with_conv):
+    """Upsamples input tensor by factor of 2 with optional convolution.
+    
+    Args:
+        in_channels: Number of input channels
+        with_conv: If True, applies 3x3 convolution after upsampling
+    """
+    def __init__(self, in_channels: int, with_conv: bool):
         super().__init__()
         self.with_conv = with_conv
         if self.with_conv:
@@ -30,7 +65,7 @@ class Upsample(nn.Module):
                 in_channels, in_channels, kernel_size=3, stride=1, padding=1
             )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
         if self.with_conv:
             x = self.conv(x)
@@ -38,7 +73,13 @@ class Upsample(nn.Module):
 
 
 class Downsample(nn.Module):
-    def __init__(self, in_channels, with_conv):
+    """Downsamples input tensor by factor of 2 with optional convolution.
+    
+    Args:
+        in_channels: Number of input channels
+        with_conv: If True, uses strided convolution, otherwise uses average pooling
+    """
+    def __init__(self, in_channels: int, with_conv: bool):
         super().__init__()
         self.with_conv = with_conv
         if self.with_conv:
@@ -47,7 +88,7 @@ class Downsample(nn.Module):
                 in_channels, in_channels, kernel_size=3, stride=2, padding=0
             )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.with_conv:
             pad = (0, 1, 0, 1)
             x = torch.nn.functional.pad(x, pad, mode="constant", value=0)
@@ -58,14 +99,23 @@ class Downsample(nn.Module):
 
 
 class ResnetBlock(nn.Module):
+    """ResNet block with optional time embedding and dropout.
+    
+    Args:
+        in_channels: Number of input channels
+        out_channels: Number of output channels. If None, same as in_channels
+        conv_shortcut: If True, uses 3x3 conv for skip connection, else 1x1
+        dropout: Dropout probability
+        temb_channels: Number of time embedding channels. If >0, adds time conditioning
+    """
     def __init__(
         self,
         *,
-        in_channels,
-        out_channels=None,
-        conv_shortcut=False,
-        dropout,
-        temb_channels=512,
+        in_channels: int,
+        out_channels: Optional[int] = None,
+        conv_shortcut: bool = False,
+        dropout: float,
+        temb_channels: int = 512,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -94,7 +144,7 @@ class ResnetBlock(nn.Module):
                     in_channels, out_channels, kernel_size=1, stride=1, padding=0
                 )
 
-    def forward(self, x, temb):
+    def forward(self, x: torch.Tensor, temb: Optional[torch.Tensor]) -> torch.Tensor:
         h = x
         h = self.norm1(h)
         h = nonlinearity(h)
@@ -118,7 +168,12 @@ class ResnetBlock(nn.Module):
 
 
 class AttnBlock(nn.Module):
-    def __init__(self, in_channels):
+    """Self-attention block using vanilla attention implementation.
+    
+    Args:
+        in_channels: Number of input channels
+    """
+    def __init__(self, in_channels: int):
         super().__init__()
         print(f"building AttnBlock (vanilla) with {in_channels} in_channels")
 
@@ -138,7 +193,7 @@ class AttnBlock(nn.Module):
             in_channels, in_channels, kernel_size=1, stride=1, padding=0
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         h_ = x
         h_ = self.norm(h_)
         q = self.q(h_)
@@ -166,14 +221,15 @@ class AttnBlock(nn.Module):
 
 
 class MemoryEfficientAttnBlock(nn.Module):
+    """Memory efficient attention block using xformers implementation.
+    
+    This is a single-head self-attention operation optimized for memory usage.
+    See: https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
+    
+    Args:
+        in_channels: Number of input channels
     """
-    Uses xformers efficient implementation,
-    see https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
-    Note: this is a single-head self-attention operation
-    """
-
-    #
-    def __init__(self, in_channels):
+    def __init__(self, in_channels: int):
         super().__init__()
         print(
             f"building MemoryEfficientAttnBlock (xformers) with {in_channels} in_channels"
@@ -195,7 +251,7 @@ class MemoryEfficientAttnBlock(nn.Module):
         )
         self.attention_op: Optional[Any] = None
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         h_ = x
         h_ = self.norm(h_)
         q = self.q(h_)
@@ -230,8 +286,12 @@ class MemoryEfficientAttnBlock(nn.Module):
 
 
 class SDPAttnBlock(nn.Module):
-
-    def __init__(self, in_channels):
+    """Attention block using PyTorch's scaled dot product attention.
+    
+    Args:
+        in_channels: Number of input channels
+    """
+    def __init__(self, in_channels: int):
         super().__init__()
         print(f"building SDPAttnBlock (sdp) with {in_channels} in_channels")
         self.in_channels = in_channels
@@ -250,7 +310,7 @@ class SDPAttnBlock(nn.Module):
             in_channels, in_channels, kernel_size=1, stride=1, padding=0
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         h_ = x
         h_ = self.norm(h_)
         q = self.q(h_)
@@ -282,10 +342,23 @@ class SDPAttnBlock(nn.Module):
         return x + out
 
 
-def make_attn(in_channels, attn_type="vanilla", attn_kwargs=None):
+def make_attn(in_channels: int, attn_type: str = "vanilla", attn_kwargs=None) -> nn.Module:
+    """Factory function to create attention blocks of different types.
+    
+    Args:
+        in_channels: Number of input channels
+        attn_type: Type of attention ("vanilla", "sdp", "xformers", "linear", "none")
+        attn_kwargs: Additional kwargs for attention block
+        
+    Returns:
+        Attention module of specified type
+        
+    Raises:
+        NotImplementedError: If attn_type is not supported
+    """
     assert attn_type in [
         "vanilla",
-        "sdp",
+        "sdp", 
         "xformers",
         "linear",
         "none",
@@ -304,21 +377,38 @@ def make_attn(in_channels, attn_type="vanilla", attn_kwargs=None):
 
 
 class Encoder(nn.Module):
+    """Encoder module that compresses input into latent representation.
+    
+    Args:
+        ch: Base channel count
+        out_ch: Output channels
+        ch_mult: Channel multiplier for each resolution
+        num_res_blocks: Number of ResNet blocks per resolution
+        attn_resolutions: Resolutions at which to apply attention
+        dropout: Dropout probability
+        resamp_with_conv: If True, use conv for up/downsampling
+        in_channels: Number of input channels
+        resolution: Input resolution
+        z_channels: Number of channels in latent space
+        double_z: If True, doubles latent channels
+        use_linear_attn: If True, uses linear attention
+        **ignore_kwargs: Additional unused kwargs
+    """
     def __init__(
         self,
         *,
-        ch,
-        out_ch,
-        ch_mult=(1, 2, 4, 8),
-        num_res_blocks,
-        attn_resolutions,
-        dropout=0.0,
-        resamp_with_conv=True,
-        in_channels,
-        resolution,
-        z_channels,
-        double_z=True,
-        use_linear_attn=False,
+        ch: int,
+        out_ch: int,
+        ch_mult: tuple = (1, 2, 4, 8),
+        num_res_blocks: int,
+        attn_resolutions: list,
+        dropout: float = 0.0,
+        resamp_with_conv: bool = True,
+        in_channels: int,
+        resolution: int,
+        z_channels: int,
+        double_z: bool = True,
+        use_linear_attn: bool = False,
         **ignore_kwargs,
     ):
         super().__init__()
@@ -398,7 +488,7 @@ class Encoder(nn.Module):
             padding=1,
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # timestep embedding
         temb = None
 
@@ -427,22 +517,40 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
+    """Decoder module that reconstructs input from latent representation.
+    
+    Args:
+        ch: Base channel count
+        out_ch: Output channels
+        ch_mult: Channel multiplier for each resolution
+        num_res_blocks: Number of ResNet blocks per resolution
+        attn_resolutions: Resolutions at which to apply attention
+        dropout: Dropout probability
+        resamp_with_conv: If True, use conv for up/downsampling
+        in_channels: Number of input channels
+        resolution: Input resolution
+        z_channels: Number of channels in latent space
+        give_pre_end: If True, return features before final conv
+        tanh_out: If True, apply tanh to output
+        use_linear_attn: If True, uses linear attention
+        **ignorekwargs: Additional unused kwargs
+    """
     def __init__(
         self,
         *,
-        ch,
-        out_ch,
-        ch_mult=(1, 2, 4, 8),
-        num_res_blocks,
-        attn_resolutions,
-        dropout=0.0,
-        resamp_with_conv=True,
-        in_channels,
-        resolution,
-        z_channels,
-        give_pre_end=False,
-        tanh_out=False,
-        use_linear_attn=False,
+        ch: int,
+        out_ch: int,
+        ch_mult: tuple = (1, 2, 4, 8),
+        num_res_blocks: int,
+        attn_resolutions: list,
+        dropout: float = 0.0,
+        resamp_with_conv: bool = True,
+        in_channels: int,
+        resolution: int,
+        z_channels: int,
+        give_pre_end: bool = False,
+        tanh_out: bool = False,
+        use_linear_attn: bool = False,
         **ignorekwargs,
     ):
         super().__init__()
@@ -523,7 +631,7 @@ class Decoder(nn.Module):
             block_in, out_ch, kernel_size=3, stride=1, padding=1
         )
 
-    def forward(self, z):
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         # assert z.shape[1:] == self.z_shape[1:]
         self.last_z_shape = z.shape
 
@@ -560,8 +668,13 @@ class Decoder(nn.Module):
 
 
 class AutoencoderKL(nn.Module):
-
-    def __init__(self, ddconfig, embed_dim):
+    """VAE model with KL-regularized latent space.
+    
+    Args:
+        ddconfig: Dictionary containing VAE architecture configuration
+        embed_dim: Dimension of the latent space
+    """
+    def __init__(self, ddconfig: dict, embed_dim: int):
         super().__init__()
         self.encoder = Encoder(**ddconfig)
         self.decoder = Decoder(**ddconfig)
@@ -570,18 +683,43 @@ class AutoencoderKL(nn.Module):
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
         self.embed_dim = embed_dim
 
-    def encode(self, x):
+    def encode(self, x: torch.Tensor) -> DiagonalGaussianDistribution:
+        """Encode input to latent distribution.
+        
+        Args:
+            x: Input tensor
+            
+        Returns:
+            Gaussian distribution over latent space
+        """
         h = self.encoder(x)
         moments = self.quant_conv(h)
         posterior = DiagonalGaussianDistribution(moments)
         return posterior
 
-    def decode(self, z):
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode latent vector to image.
+        
+        Args:
+            z: Latent vector
+            
+        Returns:
+            Reconstructed image
+        """
         z = self.post_quant_conv(z)
         dec = self.decoder(z)
         return dec
 
-    def forward(self, input, sample_posterior=True):
+    def forward(self, input: torch.Tensor, sample_posterior: bool = True) -> tuple[torch.Tensor, DiagonalGaussianDistribution]:
+        """Forward pass through VAE.
+        
+        Args:
+            input: Input tensor
+            sample_posterior: If True, sample from posterior, else use mode
+            
+        Returns:
+            Tuple of (reconstructed image, posterior distribution)
+        """
         posterior = self.encode(input)
         if sample_posterior:
             z = posterior.sample()

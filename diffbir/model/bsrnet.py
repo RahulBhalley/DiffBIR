@@ -1,4 +1,15 @@
-# From BSRGAN
+"""
+Implementation of BSRGAN architecture for image super-resolution.
+
+This module contains the core components of the BSRGAN model, including:
+- Residual Dense Block (RDB)
+- Residual in Residual Dense Block (RRDB) 
+- The full RRDBNet architecture
+
+The implementation is based on the paper:
+"BSRGAN: Designing a Practical Degradation Model for Deep Blind Image Super-Resolution"
+"""
+
 import functools
 import torch
 import torch.nn as nn
@@ -7,6 +18,17 @@ import torch.nn.init as init
 
 
 def initialize_weights(net_l, scale=1):
+    """Initialize network weights using Kaiming initialization.
+    
+    Args:
+        net_l (nn.Module or list): Network module(s) to initialize
+        scale (float): Scaling factor for weights, used for residual blocks
+        
+    The function initializes:
+    - Conv2d layers with Kaiming normal initialization
+    - Linear layers with Kaiming normal initialization  
+    - BatchNorm2d layers with constant 1 for weights and 0 for bias
+    """
     if not isinstance(net_l, list):
         net_l = [net_l]
     for net in net_l:
@@ -27,6 +49,15 @@ def initialize_weights(net_l, scale=1):
 
 
 def make_layer(block, n_layers):
+    """Create a sequential layer composed of multiple blocks.
+    
+    Args:
+        block: Block module to use
+        n_layers (int): Number of blocks to stack
+        
+    Returns:
+        nn.Sequential: Sequential layer containing the stacked blocks
+    """
     layers = []
     for _ in range(n_layers):
         layers.append(block())
@@ -34,6 +65,16 @@ def make_layer(block, n_layers):
 
 
 class ResidualDenseBlock_5C(nn.Module):
+    """Residual Dense Block with 5 convolutions.
+    
+    A dense block where each layer's input is the concatenation of all previous layers' outputs.
+    Includes a residual connection from input to output.
+    
+    Args:
+        nf (int): Number of filters (channels)
+        gc (int): Growth channels, i.e. intermediate channels
+        bias (bool): Whether to include bias in convolutions
+    """
     def __init__(self, nf=64, gc=32, bias=True):
         super(ResidualDenseBlock_5C, self).__init__()
         # gc: growth channel, i.e. intermediate channels
@@ -57,8 +98,14 @@ class ResidualDenseBlock_5C(nn.Module):
 
 
 class RRDB(nn.Module):
-    '''Residual in Residual Dense Block'''
-
+    """Residual in Residual Dense Block.
+    
+    Combines multiple Residual Dense Blocks in a residual manner.
+    
+    Args:
+        nf (int): Number of filters
+        gc (int): Growth channels for the ResidualDenseBlock_5C
+    """
     def __init__(self, nf, gc=32):
         super(RRDB, self).__init__()
         self.RDB1 = ResidualDenseBlock_5C(nf, gc)
@@ -73,6 +120,19 @@ class RRDB(nn.Module):
 
 
 class RRDBNet(nn.Module):
+    """RRDBNet architecture for image super-resolution.
+    
+    A deep network using Residual in Residual Dense Blocks (RRDB) as its building blocks.
+    Supports x2 and x4 upscaling factors.
+    
+    Args:
+        in_nc (int): Number of input channels (default: 3 for RGB)
+        out_nc (int): Number of output channels (default: 3 for RGB)
+        nf (int): Number of filters
+        nb (int): Number of RRDB blocks
+        gc (int): Growth channels for RRDB
+        sf (int): Scaling factor, either 2 or 4 (default: 4)
+    """
     def __init__(self, in_nc=3, out_nc=3, nf=64, nb=23, gc=32, sf=4):
         super(RRDBNet, self).__init__()
         RRDB_block_f = functools.partial(RRDB, nf=nf, gc=gc)
