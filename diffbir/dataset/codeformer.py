@@ -19,6 +19,30 @@ from ..utils.common import instantiate_from_config
 
 
 class CodeformerDataset(data.Dataset):
+    """Dataset for training CodeFormer model.
+    
+    This dataset loads high quality images and generates corresponding low quality versions
+    by applying a series of degradation operations including:
+    - Gaussian blur with random kernels
+    - Random downsampling
+    - Optional Gaussian noise
+    - Optional JPEG compression artifacts
+    
+    The dataset supports different cropping strategies and can optionally include text prompts.
+
+    Args:
+        file_list (str): Path to file containing list of image paths and prompts
+        file_backend_cfg (Mapping[str, Any]): Configuration for file backend system
+        out_size (int): Output image size (both height and width)
+        crop_type (str): Type of cropping - 'none', 'center' or 'random'
+        blur_kernel_size (int): Size of blur kernel
+        kernel_list (Sequence[str]): List of kernel types to use
+        kernel_prob (Sequence[float]): Probability of each kernel type
+        blur_sigma (Sequence[float]): Range of blur sigma values [min, max]
+        downsample_range (Sequence[float]): Range of downsample scales [min, max]
+        noise_range (Sequence[float]): Range of noise levels [min, max]
+        jpeg_range (Sequence[int]): Range of JPEG quality values [min, max]
+    """
 
     def __init__(
         self,
@@ -53,6 +77,16 @@ class CodeformerDataset(data.Dataset):
     def load_gt_image(
         self, image_path: str, max_retry: int = 5
     ) -> Optional[np.ndarray]:
+        """Load and preprocess ground truth image.
+        
+        Args:
+            image_path (str): Path to the image file
+            max_retry (int, optional): Maximum number of retries for loading. Defaults to 5.
+            
+        Returns:
+            Optional[np.ndarray]: Loaded and preprocessed image array, or None if loading fails
+            Image is returned in RGB format with shape (H,W,3) and dtype uint8 (0-255 range)
+        """
         image_bytes = None
         while image_bytes is None:
             if max_retry == 0:
@@ -77,6 +111,22 @@ class CodeformerDataset(data.Dataset):
         return image
 
     def __getitem__(self, index: int) -> Dict[str, Union[np.ndarray, str]]:
+        """Get a data sample by index.
+        
+        This method:
+        1. Loads a ground truth image
+        2. Generates a low quality version through degradation pipeline
+        3. Randomly drops the text prompt 50% of the time
+        
+        Args:
+            index (int): Index of the sample to get
+            
+        Returns:
+            Tuple containing:
+            - gt: Ground truth image array (RGB, -1 to 1 range, float32)
+            - lq: Low quality image array (RGB, 0 to 1 range, float32) 
+            - prompt: Text prompt string (empty 50% of the time)
+        """
         # load gt image
         img_gt = None
         while img_gt is None:
@@ -130,4 +180,9 @@ class CodeformerDataset(data.Dataset):
         return gt, lq, prompt
 
     def __len__(self) -> int:
+        """Get the total number of samples in the dataset.
+        
+        Returns:
+            int: Number of samples
+        """
         return len(self.image_files)

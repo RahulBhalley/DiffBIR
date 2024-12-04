@@ -13,18 +13,41 @@ from .degradation import (
 
 
 class BatchTransform:
+    """Base class for batch transformations."""
 
     @overload
     def __call__(self, batch: Any) -> Any: ...
 
 
 class IdentityBatchTransform(BatchTransform):
+    """Transform that returns the input batch unchanged."""
 
     def __call__(self, batch: Any) -> Any:
+        """Return input batch without modification.
+        
+        Args:
+            batch: Input batch of any type
+            
+        Returns:
+            The input batch unchanged
+        """
         return batch
 
 
 class RealESRGANBatchTransform(BatchTransform):
+    """Implements the RealESRGAN degradation pipeline for realistic image degradation.
+    
+    This transform applies a series of degradation operations to high quality images to generate
+    realistic low quality images. The degradation process includes:
+    - Two-stage degradation pipeline
+    - Blur with kernels
+    - Random resizing 
+    - Gaussian and Poisson noise
+    - JPEG compression
+    - Optional image sharpening
+    
+    The transform maintains a queue of training pairs to increase degradation diversity within batches.
+    """
 
     def __init__(
         self,
@@ -47,6 +70,31 @@ class RealESRGANBatchTransform(BatchTransform):
         poisson_scale_range2: Sequence[float],
         jpeg_range2: Sequence[int],
     ) -> "RealESRGANBatchTransform":
+        """Initialize RealESRGAN transform.
+        
+        Args:
+            use_sharpener: Whether to apply USM sharpening to input images
+            queue_size: Size of training pair queue for diversity
+            resize_prob: Probabilities of up/down/keep resizing [up, down, keep] for first stage
+            resize_range: Min/max resize scale range [min, max] for first stage
+            gray_noise_prob: Probability of using grayscale noise in first stage
+            gaussian_noise_prob: Probability of using Gaussian vs Poisson noise in first stage
+            noise_range: Gaussian noise sigma range [min, max] for first stage
+            poisson_scale_range: Poisson noise scale range [min, max] for first stage
+            jpeg_range: JPEG compression quality range [min, max] for first stage
+            second_blur_prob: Probability of applying second blur
+            stage2_scale: Target scale for second degradation stage (float or [min, max])
+            resize_prob2: Probabilities of up/down/keep resizing for second stage
+            resize_range2: Min/max resize scale range for second stage
+            gray_noise_prob2: Probability of grayscale noise in second stage
+            gaussian_noise_prob2: Probability of Gaussian vs Poisson noise in second stage
+            noise_range2: Gaussian noise sigma range for second stage
+            poisson_scale_range2: Poisson noise scale range for second stage
+            jpeg_range2: JPEG compression quality range for second stage
+            
+        Returns:
+            Initialized RealESRGANBatchTransform instance
+        """
         super().__init__()
         # resize settings for the first degradation process
         self.resize_prob = resize_prob
@@ -88,11 +136,12 @@ class RealESRGANBatchTransform(BatchTransform):
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self):
-        """It is the training pair pool for increasing the diversity in a batch.
+        """Manage training pair queue to increase degradation diversity.
 
-        Batch processing limits the diversity of synthetic degradations in a batch. For example, samples in a
-        batch could not have different resize scaling factors. Therefore, we employ this training pair pool
-        to increase the degradation diversity in a batch.
+        This method maintains a queue of training pairs (LQ-HQ) to increase the diversity of degradations
+        within a batch. When the queue is full, it dequeues old pairs and enqueues new ones with random
+        shuffling. This helps overcome the limitation of batch processing where samples in a batch
+        must share degradation parameters.
         """
         # initialize
         b, c, h, w = self.lq.size()
@@ -143,6 +192,22 @@ class RealESRGANBatchTransform(BatchTransform):
     def __call__(
         self, batch: Dict[str, Union[torch.Tensor, str]]
     ) -> Dict[str, Union[torch.Tensor, List[str]]]:
+        """Apply RealESRGAN degradation pipeline to generate LQ-HQ image pairs.
+        
+        Args:
+            batch: Dictionary containing:
+                - hq: High quality input images
+                - kernel1: First blur kernel
+                - kernel2: Second blur kernel  
+                - sinc_kernel: Final sinc filter kernel
+                - txt: Text descriptions/captions
+                
+        Returns:
+            Tuple containing:
+            - HQ images normalized to [-1,1]
+            - LQ images normalized to [0,1] 
+            - Text descriptions
+        """
         # training data synthesis
         hq = batch["hq"]
         if self.use_sharpener:

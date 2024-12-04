@@ -16,10 +16,25 @@ class BaseStorageBackend(metaclass=ABCMeta):
 
     @property
     def name(self) -> str:
+        """Get the name of the storage backend.
+
+        Returns:
+            str: Name of the storage backend, which is the class name.
+        """
         return self.__class__.__name__
 
     @abstractmethod
     def get(self, filepath: str) -> bytes:
+        """Abstract method to read data from a file path.
+
+        All backends must implement this method to read data as bytes.
+
+        Args:
+            filepath (str): Path to read data from.
+
+        Returns:
+            bytes: Data read from the file path.
+        """
         pass
 
 
@@ -46,6 +61,9 @@ class PetrelBackend(BaseStorageBackend):
         >>> client = PetrelBackend()
         >>> client.get(filepath1)  # get data from default cluster
         >>> client.get(filepath2)  # get data from 'cluster-name' cluster
+
+    Note:
+        This backend requires the ``petrel_client`` package to be installed.
     """
 
     def __init__(self,
@@ -67,7 +85,10 @@ class PetrelBackend(BaseStorageBackend):
         :attr:`self.path_mapping`.
 
         Args:
-            filepath (str): Path to be mapped.
+            filepath (str or Path): Path to be mapped.
+
+        Returns:
+            str: Mapped filepath with replaced prefix according to path_mapping.
         """
         filepath = str(filepath)
         if self.path_mapping is not None:
@@ -85,6 +106,9 @@ class PetrelBackend(BaseStorageBackend):
 
         Args:
             filepath (str): Path to be formatted.
+
+        Returns:
+            str: Formatted filepath with forward slashes.
         """
         return re.sub(r'\\+', '/', filepath)
 
@@ -95,7 +119,11 @@ class PetrelBackend(BaseStorageBackend):
             filepath (str or Path): Path to read data.
 
         Returns:
-            bytes: The loaded bytes.
+            bytes: The loaded bytes from the file.
+
+        Note:
+            This method will first map the filepath using path_mapping if defined,
+            then format it to use forward slashes before reading.
         """
         filepath = self._map_path(filepath)
         filepath = self._format_path(filepath)
@@ -104,7 +132,10 @@ class PetrelBackend(BaseStorageBackend):
 
 
 class HardDiskBackend(BaseStorageBackend):
-    """Raw hard disks storage backend."""
+    """Raw hard disks storage backend.
+
+    A simple storage backend that reads files directly from hard disk.
+    """
 
     def get(self, filepath: Union[str, Path]) -> bytes:
         """Read data from a given ``filepath`` with 'rb' mode.
@@ -113,7 +144,11 @@ class HardDiskBackend(BaseStorageBackend):
             filepath (str or Path): Path to read data.
 
         Returns:
-            bytes: Expected bytes object.
+            bytes: Expected bytes object read from the file.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+            IOError: If there are any I/O related errors while reading.
         """
         with open(filepath, 'rb') as f:
             value_buf = f.read()

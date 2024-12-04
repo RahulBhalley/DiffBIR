@@ -15,6 +15,43 @@ from ..utils.common import instantiate_from_config
 
 
 class RealESRGANDataset(data.Dataset):
+    """Dataset that generates degraded images following the RealESRGAN approach.
+    
+    This dataset loads high quality images and applies a series of degradations to simulate
+    low quality images. The degradation process includes:
+    1. Loading and cropping high quality images
+    2. Applying data augmentation (horizontal flip and rotation)
+    3. Generating and applying two stages of blur kernels
+    4. Optionally applying a final sinc filter
+    
+    The dataset also handles text prompts associated with the images, with options for
+    using short or long prompts.
+
+    Args:
+        file_metas (List[Dict[str, str]]): List of image metadata containing paths and prompts
+        p_long_prompt (float): Probability of using long prompt instead of short prompt
+        file_backend_cfg (Mapping[str, Any]): Configuration for file backend system
+        out_size (int): Output image size (both height and width)
+        crop_type (str): Type of cropping - 'none', 'center' or 'random'
+        use_hflip (bool): Whether to use horizontal flip augmentation
+        use_rot (bool): Whether to use rotation augmentation
+        blur_kernel_size (int): Size of blur kernel for first degradation stage
+        kernel_list (Sequence[str]): List of kernel types for first stage
+        kernel_prob (Sequence[float]): Probability of each kernel type for first stage
+        blur_sigma (Sequence[float]): Sigma range for Gaussian blur in first stage
+        betag_range (Sequence[float]): Beta range for Gaussian kernel in first stage
+        betap_range (Sequence[float]): Beta range for Plateau kernel in first stage
+        sinc_prob (float): Probability of using sinc kernel in first stage
+        blur_kernel_size2 (int): Size of blur kernel for second degradation stage
+        kernel_list2 (Sequence[str]): List of kernel types for second stage
+        kernel_prob2 (Sequence[float]): Probability of each kernel type for second stage
+        blur_sigma2 (Sequence[float]): Sigma range for Gaussian blur in second stage
+        betag_range2 (Sequence[float]): Beta range for Gaussian kernel in second stage
+        betap_range2 (Sequence[float]): Beta range for Plateau kernel in second stage
+        sinc_prob2 (float): Probability of using sinc kernel in second stage
+        final_sinc_prob (float): Probability of applying final sinc filter
+        p_empty_prompt (float): Probability of using empty prompt
+    """
 
     def __init__(
         self,
@@ -90,6 +127,15 @@ class RealESRGANDataset(data.Dataset):
     def load_gt_image(
         self, image_path: str, max_retry: int = 5
     ) -> Optional[np.ndarray]:
+        """Load and process a ground truth image.
+        
+        Args:
+            image_path (str): Path to the image file
+            max_retry (int): Maximum number of retries for loading image
+            
+        Returns:
+            Optional[np.ndarray]: Loaded and processed image array, or None if loading fails
+        """
         image_bytes = None
         while image_bytes is None:
             if max_retry == 0:
@@ -125,6 +171,25 @@ class RealESRGANDataset(data.Dataset):
 
     @torch.no_grad()
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        """Get a training sample.
+        
+        This method:
+        1. Loads a high quality image
+        2. Applies data augmentation
+        3. Generates degradation kernels
+        4. Prepares the associated text prompt
+        
+        Args:
+            index (int): Index of the sample to get
+            
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary containing:
+                - 'hq': High quality image tensor
+                - 'kernel1': First degradation kernel
+                - 'kernel2': Second degradation kernel
+                - 'sinc_kernel': Final sinc kernel
+                - 'txt': Associated text prompt
+        """
         # -------------------------------- Load hq images -------------------------------- #
         # load gt image
         img_gt = None
@@ -223,4 +288,9 @@ class RealESRGANDataset(data.Dataset):
         }
 
     def __len__(self) -> int:
+        """Get the total number of samples in the dataset.
+        
+        Returns:
+            int: Number of samples
+        """
         return len(self.image_files)
