@@ -133,20 +133,41 @@ class InferenceLoop:
         os.makedirs(self.save_dir, exist_ok=True)
 
     def load_lq(self) -> Generator[Image.Image, None, None]:
+        """Load low-quality images for inference.
+        
+        Supports both single image path and directory path containing multiple images.
+        """
         img_exts = [".png", ".jpg", ".jpeg"]
-        assert os.path.isdir(
-            self.args.input
-        ), "Please put your low-quality images in a folder."
-        for file_name in sorted(os.listdir(self.args.input)):
-            stem, ext = os.path.splitext(file_name)
-            if ext not in img_exts:
-                print(f"{file_name} is not an image, continue")
-                continue
-            file_path = os.path.join(self.args.input, file_name)
-            lq = Image.open(file_path).convert("RGB")
-            print(f"load lq: {file_path}")
-            self.loop_ctx["file_stem"] = stem
+        
+        if os.path.isfile(self.args.input):
+            # Single image case
+            _, ext = os.path.splitext(self.args.input)
+            if ext.lower() not in img_exts:
+                raise ValueError(f"{self.args.input} is not a supported image file. Supported extensions: {img_exts}")
+            
+            lq = Image.open(self.args.input).convert("RGB")
+            print(f"load lq: {self.args.input}")
+            self.loop_ctx["file_stem"] = os.path.splitext(os.path.basename(self.args.input))[0]
             yield lq
+            
+        elif os.path.isdir(self.args.input):
+            # Directory case
+            for file_name in sorted(os.listdir(self.args.input)):
+                stem, ext = os.path.splitext(file_name)
+                if ext.lower() not in img_exts:
+                    print(f"{file_name} is not an image, continue")
+                    continue
+                file_path = os.path.join(self.args.input, file_name)
+                lq = Image.open(file_path).convert("RGB")
+                print(f"load lq: {file_path}")
+                self.loop_ctx["file_stem"] = stem
+                yield lq
+                
+        else:
+            raise ValueError(
+                f"Input path {self.args.input} is neither a valid image file nor a directory. "
+                f"Please provide either a single image path or a directory containing images."
+            )
 
     def after_load_lq(self, lq: Image.Image) -> np.ndarray:
         return np.array(lq)
